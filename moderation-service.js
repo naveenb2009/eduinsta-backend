@@ -73,6 +73,227 @@ Respond with ONLY a JSON object, no markdown fences, no commentary:
 /* Upload the file to Gemini's Files API, then ask the model about it.
    Files API is used rather than inline base64 because reels routinely exceed
    the inline request size limit. */
+/* Model IDs available on the Gemini API vary by account, region and over time,
+   so hardcoding one produces intermittent 404s. Instead we ask the API which
+   models this key can actually use, and pick the best available that supports
+   generateContent. Result is cached for the process lifetime. */
+let cachedModel = null;
+const MODEL_PREFERENCE = [
+  'gemini-flash-latest',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-flash-lite-latest',
+  'gemini-2.0-flash-001',
+  'gemini-pro-latest',
+];
+
+async function pickModel(key) {
+  if (cachedModel) return cachedModel;
+  if (process.env.GEMINI_MODEL) {
+    cachedModel = process.env.GEMINI_MODEL;   // explicit override wins
+    return cachedModel;
+  }
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
+  if (!res.ok) throw new Error(`Could not list Gemini models: ${res.status}`);
+  const data = await res.json();
+  const usable = (data.models || [])
+    .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map((m) => String(m.name).replace(/^models\//, ''));
+
+  if (!usable.length) throw new Error('No Gemini models available for this API key');
+
+  cachedModel =
+    MODEL_PREFERENCE.find((p) => usable.includes(p)) ||
+    usable.find((m) => m.includes('flash')) ||
+    usable[0];
+
+  console.log(`Moderation using Gemini model: ${cachedModel}`);
+  return cachedModel;
+}
+
+async function analyseVideo(buffer, mimeType) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('GEMINI_API_KEY not configured');
+  const model = await pickModel(key);
+
+  // 1. Upload
+  const uploadRes = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${key}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'raw',
+        'Content-Type': mimeType || 'video/mp4',
+      },
+      body: buffer,
+    }
+  );
+  if (!uploadRes.ok) throw new Error(`Gemini upload failed: ${uploadRes.status}`);
+  const uploaded = await uploadRes.json();
+  const fileUri = uploaded?.file?.uri;
+  const fileName = uploaded?.file?.name;
+  if (!fileUri) throw new Error('Gemini did not return a file URI');
+
+  // 2. Wait for processing — video files are not queryable immediately
+  let state = uploaded.file.state;
+  for (let i = 0; i < 30 && state === 'PROCESSING'; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const st = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${key}`
+    );
+    const j = await st.json();
+    state = j?.state;
+  }
+  if (state !== 'ACTIVE') throw new Error(`Gemini file not ready (state: ${state})`);
+
+  // 3. Ask the model
+  const genRes = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: buildPrompt() },
+            { file_data: { mime_type: mimeType || 'video/mp4', file_uri: fileUri } },
+          ],
+        }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    }
+  );
+  if (!genRes.ok) {
+    const body = await genRes.text().catch(() => '');
+    if (genRes.status === 404) {
+      // The chosen model vanished or isn't valid for this key — clear the cache
+      // so the next attempt re-discovers, and report something actionable.
+      cachedModel = null;
+      throw new Error(`Gemini model "${model}" not available for this API key (404). ${body.slice(0, 200)}`);
+    }
+    throw new Error(`Gemini analysis failed: ${genRes.status} ${body.slice(0, 200)}`);
+  }
+  const data = await genRes.json();
+
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  let verdict;
+  try {
+    verdict = JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch {
+    throw new Error('Could not parse the moderation verdict');
+  }
+
+  // 4. Clean up the uploaded file — don't leave user video sitting on Google's servers
+  fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${key}`, {
+    method: 'DELETE',
+  }).catch(() => {});
+
+  return verdict;
+}
+
+/* Decide the final outcome. Deliberately conservative:
+   - any safety flag is an automatic reject, whatever the model said
+   - low confidence goes to a human queue instead of auto-approving
+   Failing "open" (approving on error) would let anything through simply by
+   breaking the API, so errors route to manual review instead. */
+const MIN_CONFIDENCE = Number(process.env.MODERATION_MIN_CONFIDENCE || 0.7);
+
+async function moderateVideo(buffer, mimeType) {
+  let verdict;
+  try {
+    verdict = await analyseVideo(buffer, mimeType);
+  } catch (err) {
+    console.error('Moderation error:', err.message);
+    return {
+      status: 'manual_review',
+      approved: false,
+      reason: 'Automatic review is unavailable right now. Your reel has been queued for manual review.',
+      error: err.message,
+    };
+  }
+
+  const flags = Array.isArray(verdict.safety_flags) ? verdict.safety_flags : [];
+  if (flags.length) {
+    return {
+      status: 'rejected',
+      approved: false,
+      category: verdict.category,
+      reason: verdict.reason || 'This video does not meet our content safety guidelines.',
+      safety_flags: flags,
+    };
+  }
+
+  if (!verdict.approved) {
+    return {
+      status: 'rejected',
+      approved: false,
+      category: verdict.category || 'not_educational',
+      reason: verdict.reason || 'This video does not appear to be educational content.',
+    };
+  }
+
+  const confidence = Number(verdict.confidence ?? 0);
+  if (confidence < MIN_CONFIDENCE) {
+    return {
+      status: 'manual_review',
+      approved: false,
+      category: verdict.category,
+      confidence,
+      reason: `We need a closer look at this one (confidence ${Math.round(confidence * 100)}%). It has been queued for manual review.`,
+    };
+  }
+
+  return {
+    status: 'approved',
+    approved: true,
+    category: verdict.category,
+    subject: verdict.subject,
+    confidence,
+    suggested_title: verdict.suggested_title || null,
+    reason: verdict.reason || 'Educational content confirmed.',
+  };
+}
+
+module.exports = { moderateVideo, ALLOWED_CATEGORIES };
+or inform about a genuine educational subject. Examples that qualify:
+- explaining a concept in science, maths, engineering, medicine
+- history, geography, economics, civics, law
+- language learning, literature analysis
+- exam preparation, problem solving, study techniques
+- practical skills instruction, lab demonstrations, how things work
+
+REJECT if it is primarily:
+- entertainment, comedy, memes, pranks, dance, music videos
+- vlogs, lifestyle, travel diaries with no instructional content
+- product promotion, advertising, get-rich-quick or crypto hype
+- religious or political persuasion rather than factual education
+- unrelated personal content
+- gameplay with no instructional framing
+
+ALSO REJECT (regardless of educational framing) if it contains:
+- sexual or suggestive content
+- graphic violence, gore, or self-harm
+- instructions for weapons, explosives, drugs, or illegal activity
+- hate speech, harassment, or content demeaning a group
+- dangerous activities a viewer might imitate
+- content that appears to sexualise or endanger minors
+- demonstrably false claims presented as fact (e.g. medical misinformation)
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{
+  "approved": true or false,
+  "category": one of ${JSON.stringify(ALLOWED_CATEGORIES)} or "not_educational",
+  "subject": "short specific topic, e.g. 'Ohm's Law'",
+  "confidence": 0.0 to 1.0,
+  "reason": "one clear sentence the uploader will read",
+  "safety_flags": ["array of any serious concerns, empty if none"],
+  "suggested_title": "a concise accurate title, or null"
+}`;
+}
+
+/* Upload the file to Gemini's Files API, then ask the model about it.
+   Files API is used rather than inline base64 because reels routinely exceed
+   the inline request size limit. */
 async function analyseVideo(buffer, mimeType) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY not configured');
