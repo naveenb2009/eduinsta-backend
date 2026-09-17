@@ -41,38 +41,103 @@ function generateCode() {
   return String(crypto.randomInt(100000, 1000000));
 }
 
-/* ---------------- Email transport ---------------- */
+/* ---------------- Email transport ----------------
+   IMPORTANT: many hosts (including Render's free tier) BLOCK outbound SMTP
+   ports 25/465/587 to prevent spam abuse. Gmail SMTP will fail there with
+   "Connection timeout" no matter how correct your credentials are.
+
+   So we prefer HTTP email APIs, which go over normal HTTPS (port 443) and
+   work on every host. SMTP is kept only as a fallback for environments that
+   allow it (a VPS, or local development).
+
+   Provider is chosen by whichever key you set, in this order:
+     1. BREVO_API_KEY   - 300 emails/day free, no domain needed. Easiest start.
+     2. RESEND_API_KEY  - 3,000/month free; free tier can only send to your own
+                          address until you verify a domain.
+     3. SMTP_*          - only if your host permits SMTP.                     */
+
+function otpEmailHtml(code) {
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px">
+      <h2 style="color:#0f766e;margin:0 0 4px">EduInsta</h2>
+      <p style="color:#555">Your verification code is:</p>
+      <div style="font-size:34px;font-weight:800;letter-spacing:.2em;color:#0f766e;
+                  background:#f2fbf9;border-radius:12px;padding:16px;text-align:center">${code}</div>
+      <p style="color:#777;font-size:13px">This code expires in 5 minutes.</p>
+      <p style="color:#999;font-size:12px">If you didn't request this, you can ignore this email.</p>
+    </div>`;
+}
+
+const FROM_EMAIL = process.env.MAIL_FROM_EMAIL || process.env.SMTP_USER || 'onboarding@resend.dev';
+const FROM_NAME = process.env.MAIL_FROM_NAME || 'EduInsta';
+
+async function sendViaBrevo(to, code) {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': process.env.BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: FROM_NAME, email: FROM_EMAIL },
+      to: [{ email: to }],
+      subject: `${code} is your EduInsta verification code`,
+      htmlContent: otpEmailHtml(code),
+    }),
+  });
+  if (!res.ok) throw new Error(`Brevo ${res.status}: ${await res.text()}`);
+}
+
+async function sendViaResend(to, code) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: `${FROM_NAME} <${FROM_EMAIL}>`,
+      to: [to],
+      subject: `${code} is your EduInsta verification code`,
+      html: otpEmailHtml(code),
+    }),
+  });
+  if (!res.ok) throw new Error(`Resend ${res.status}: ${await res.text()}`);
+}
+
 let mailer = null;
 function getMailer() {
   if (mailer) return mailer;
   if (!process.env.SMTP_HOST) return null;
+  const nodemailer = require('nodemailer');
   mailer = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: Number(process.env.SMTP_PORT) === 465,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    connectionTimeout: 10000,
   });
   return mailer;
 }
 
-async function sendEmailOtp(to, code) {
+async function sendViaSmtp(to, code) {
   const transport = getMailer();
-  if (!transport) throw new Error('SMTP not configured');
+  if (!transport) throw new Error('No email provider configured');
   await transport.sendMail({
-    from: process.env.SMTP_FROM || `EduInsta <${process.env.SMTP_USER}>`,
+    from: `${FROM_NAME} <${FROM_EMAIL}>`,
     to,
     subject: `${code} is your EduInsta verification code`,
-    text: `Your EduInsta verification code is ${code}. It expires in 5 minutes.\n\nIf you didn't request this, ignore this email.`,
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px">
-        <h2 style="color:#0f766e;margin:0 0 4px">EduInsta</h2>
-        <p style="color:#555">Your verification code is:</p>
-        <div style="font-size:34px;font-weight:800;letter-spacing:.2em;color:#0f766e;
-                    background:#f2fbf9;border-radius:12px;padding:16px;text-align:center">${code}</div>
-        <p style="color:#777;font-size:13px">This code expires in 5 minutes.</p>
-        <p style="color:#999;font-size:12px">If you didn't request this, you can ignore this email.</p>
-      </div>`,
+    text: `Your EduInsta verification code is ${code}. It expires in 5 minutes.`,
+    html: otpEmailHtml(code),
   });
+}
+
+async function sendEmailOtp(to, code) {
+  if (process.env.BREVO_API_KEY) return sendViaBrevo(to, code);
+  if (process.env.RESEND_API_KEY) return sendViaResend(to, code);
+  if (process.env.SMTP_HOST) return sendViaSmtp(to, code);
+  throw new Error('No email provider configured — set BREVO_API_KEY (recommended on Render)');
 }
 
 /* ---------------- SMS transport ----------------
