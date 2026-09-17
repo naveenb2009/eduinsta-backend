@@ -31,41 +31,44 @@ const ALLOWED_CATEGORIES = [
 function buildPrompt() {
   return `You are the content reviewer for EduInsta, an educational short-video platform.
 
-Watch this video and decide whether it belongs on an educational platform.
+Be GENEROUS. Your job is to let educational content through, not to gatekeep.
+If a video has ANY plausible learning, informational or skill-building value,
+APPROVE it. Only reject content that is clearly and entirely unrelated to
+learning.
 
-APPROVE only if the video's PRIMARY PURPOSE is to teach, explain, demonstrate
-or inform about a genuine educational subject. Examples that qualify:
-- explaining a concept in science, maths, engineering, medicine
-- history, geography, economics, civics, law
-- language learning, literature analysis
-- exam preparation, problem solving, study techniques
-- practical skills instruction, lab demonstrations, how things work
+APPROVE (this list is illustrative, not exhaustive):
+- any academic subject: science, maths, engineering, medicine, history,
+  geography, economics, civics, law, languages, literature
+- technology, programming, tools, software, hardware
+- exam preparation, study tips, problem solving, revision, career guidance
+- practical skills, tutorials, demonstrations, experiments, "how things work"
+- explainers, documentaries, news analysis, factual commentary
+- crafts, cooking technique, fitness technique, music theory, art technique
+- educational content aimed at children, including simple or playful formats
+- informal or entertaining teaching styles — humour does not disqualify it
+- videos that are partly personal or casual but still teach something
+- content where you are unsure: DEFAULT TO APPROVING
 
-REJECT if it is primarily:
-- entertainment, comedy, memes, pranks, dance, music videos
-- vlogs, lifestyle, travel diaries with no instructional content
-- product promotion, advertising, get-rich-quick or crypto hype
-- religious or political persuasion rather than factual education
-- unrelated personal content
-- gameplay with no instructional framing
+REJECT only if the video has no educational or informational value at all,
+for example: pure dance/lip-sync, random pets or scenery with no commentary,
+pure product advertising, or content that is simply unrelated to learning.
 
-ALSO REJECT (regardless of educational framing) if it contains:
-- sexual or suggestive content
-- graphic violence, gore, or self-harm
-- instructions for weapons, explosives, drugs, or illegal activity
-- hate speech, harassment, or content demeaning a group
-- dangerous activities a viewer might imitate
-- content that appears to sexualise or endanger minors
-- demonstrably false claims presented as fact (e.g. medical misinformation)
+SEPARATELY, set safety_flags (and only then) if the video contains:
+- sexual content, or any sexualisation of minors
+- graphic violence or gore
+- self-harm or suicide content
+- instructions for weapons, explosives, or drug manufacture
+- hate speech targeting a protected group
+These are the only hard limits. Everything else should pass.
 
 Respond with ONLY a JSON object, no markdown fences, no commentary:
 {
   "approved": true or false,
   "category": one of ${JSON.stringify(ALLOWED_CATEGORIES)} or "not_educational",
-  "subject": "short specific topic, e.g. 'Ohm's Law'",
+  "subject": "short specific topic",
   "confidence": 0.0 to 1.0,
   "reason": "one clear sentence the uploader will read",
-  "safety_flags": ["array of any serious concerns, empty if none"],
+  "safety_flags": ["only for the serious categories above; empty otherwise"],
   "suggested_title": "a concise accurate title, or null"
 }`;
 }
@@ -191,29 +194,54 @@ async function analyseVideo(buffer, mimeType) {
   return verdict;
 }
 
-/* Decide the final outcome. Deliberately conservative:
-   - any safety flag is an automatic reject, whatever the model said
-   - low confidence goes to a human queue instead of auto-approving
-   Failing "open" (approving on error) would let anything through simply by
-   breaking the API, so errors route to manual review instead. */
-const MIN_CONFIDENCE = Number(process.env.MODERATION_MIN_CONFIDENCE || 0.7);
+/* Final outcome. Deliberately permissive:
+   - there is NO manual-review state; every upload resolves to approved or rejected
+   - the confidence bar is low, so borderline educational content passes
+   - if the moderation API itself fails, we APPROVE rather than block the user,
+     and record it so the owner can look back through the dashboard
+
+   The one thing that is NOT permissive: safety_flags. Sexual content involving
+   minors, self-harm instructions and weapon/drug manufacture are hard rejects
+   regardless of how educational the framing is. That isn't strictness, it's the
+   baseline every platform needs to stay operable and lawful. */
+const MIN_CONFIDENCE = Number(process.env.MODERATION_MIN_CONFIDENCE || 0.25);
+
+/* Only these flags block an upload. Anything else the model reports is noted
+   but does not stop publication. */
+const HARD_BLOCK = [
+  'sexual', 'minor', 'child', 'csam', 'nudity', 'porn',
+  'self-harm', 'selfharm', 'suicide',
+  'weapon', 'explosive', 'bomb', 'firearm', 'drug manufacture',
+  'gore', 'graphic violence', 'hate speech',
+];
+
+function isHardBlock(flags) {
+  return flags.some((f) => {
+    const t = String(f).toLowerCase();
+    return HARD_BLOCK.some((h) => t.includes(h));
+  });
+}
 
 async function moderateVideo(buffer, mimeType) {
   let verdict;
   try {
     verdict = await analyseVideo(buffer, mimeType);
   } catch (err) {
-    console.error('Moderation error:', err.message);
+    // Fail OPEN: an outage on our side must not block a creator's upload.
+    console.error('Moderation unavailable, approving by default:', err.message);
     return {
-      status: 'manual_review',
-      approved: false,
-      reason: 'Automatic review is unavailable right now. Your reel has been queued for manual review.',
+      status: 'approved',
+      approved: true,
+      category: 'general_education',
+      confidence: null,
+      unreviewed: true,          // surfaced in the owner dashboard
+      reason: 'Published. Automatic review was unavailable, so this was approved by default.',
       error: err.message,
     };
   }
 
   const flags = Array.isArray(verdict.safety_flags) ? verdict.safety_flags : [];
-  if (flags.length) {
+  if (flags.length && isHardBlock(flags)) {
     return {
       status: 'rejected',
       approved: false,
@@ -223,34 +251,27 @@ async function moderateVideo(buffer, mimeType) {
     };
   }
 
-  if (!verdict.approved) {
-    return {
-      status: 'rejected',
-      approved: false,
-      category: verdict.category || 'not_educational',
-      reason: verdict.reason || 'This video does not appear to be educational content.',
-    };
-  }
+  const confidence = Number(verdict.confidence ?? 1);
 
-  const confidence = Number(verdict.confidence ?? 0);
-  if (confidence < MIN_CONFIDENCE) {
+  // Approve if the model said yes, OR if it said no but wasn't confident about it.
+  if (verdict.approved || confidence < MIN_CONFIDENCE) {
     return {
-      status: 'manual_review',
-      approved: false,
-      category: verdict.category,
+      status: 'approved',
+      approved: true,
+      category: verdict.category === 'not_educational' ? 'general_education' : verdict.category,
+      subject: verdict.subject,
       confidence,
-      reason: `We need a closer look at this one (confidence ${Math.round(confidence * 100)}%). It has been queued for manual review.`,
+      suggested_title: verdict.suggested_title || null,
+      reason: verdict.reason || 'Educational content confirmed.',
     };
   }
 
   return {
-    status: 'approved',
-    approved: true,
-    category: verdict.category,
-    subject: verdict.subject,
+    status: 'rejected',
+    approved: false,
+    category: verdict.category || 'not_educational',
     confidence,
-    suggested_title: verdict.suggested_title || null,
-    reason: verdict.reason || 'Educational content confirmed.',
+    reason: verdict.reason || 'This video does not appear to be educational content.',
   };
 }
 
