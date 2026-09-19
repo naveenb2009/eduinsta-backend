@@ -26,6 +26,7 @@ const cors = require('cors');
 const Razorpay = require('razorpay');
 const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
+const reelsService = require('./reels-service');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
@@ -116,6 +117,103 @@ app.post('/api/education-check', upload.single('video'), async (req, res) => {
     });
   }
   res.json(result);
+});
+
+
+/* ==================================================================
+   SHARED REELS — the endpoints that make uploads visible to everyone
+   ================================================================== */
+
+/* Publish: moderate first, then store. A rejected video is never saved,
+   so unsafe content never reaches storage at all. */
+app.post('/api/reels', upload.single('video'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No video supplied' });
+    const { title, description, category, subject, creator } = req.body;
+    if (!title || !creator) return res.status(400).json({ error: 'title and creator are required' });
+
+    const verdict = await moderateVideo(req.file.buffer, req.file.mimetype);
+    if (!verdict.approved) {
+      return res.status(422).json({ error: 'rejected', verdict });
+    }
+
+    const { key, url } = await reelsService.storeVideo(req.file.buffer, req.file.mimetype);
+    const row = await reelsService.createReel({
+      creator, title,
+      description: description || '',
+      category: category || verdict.category || '',
+      subject: subject || verdict.subject || '',
+      videoKey: key, videoUrl: url,
+    });
+    res.json({ ok: true, reel: reelsService.toClientReel(row), verdict });
+  } catch (err) {
+    console.error('publish failed:', err);
+    res.status(500).json({ error: 'Could not publish the reel' });
+  }
+});
+
+/* The shared feed. Keyset pagination — stays fast however deep you scroll. */
+app.get('/api/feed', async (req, res) => {
+  try {
+    const { items, nextCursor } = await reelsService.listReels({
+      limit: req.query.limit,
+      cursor: req.query.cursor || null,
+      creator: req.query.creator || null,
+    });
+    res.json({ reels: items.map(reelsService.toClientReel), nextCursor });
+  } catch (err) {
+    console.error('feed failed:', err);
+    res.status(500).json({ error: 'Could not load the feed' });
+  }
+});
+
+app.post('/api/reels/:id/like', async (req, res) => {
+  try {
+    const userId = req.body?.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    res.json(await reelsService.toggleLike(req.params.id, userId));
+  } catch {
+    res.status(500).json({ error: 'Could not update the like' });
+  }
+});
+
+app.post('/api/reels/:id/view', async (req, res) => {
+  try { await reelsService.incrementViews(req.params.id); res.json({ ok: true }); }
+  catch { res.json({ ok: false }); }
+});
+
+app.delete('/api/reels/:id', async (req, res) => {
+  try {
+    const ok = await reelsService.deleteReel(req.params.id, req.body?.creator);
+    res.status(ok ? 200 : 404).json({ ok });
+  } catch {
+    res.status(500).json({ error: 'Could not delete the reel' });
+  }
+});
+
+/* Fallback video streaming for when no public R2 domain is configured.
+   Supports Range requests, which video players require for seeking. */
+app.get('/api/video/:key', async (req, res) => {
+  try {
+    const { buffer, mime } = await reelsService.readVideo(decodeURIComponent(req.params.key));
+    const range = req.headers.range;
+    if (range) {
+      const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(startStr, 10) || 0;
+      const end = endStr ? parseInt(endStr, 10) : buffer.length - 1;
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${buffer.length}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': end - start + 1,
+        'Content-Type': mime,
+      });
+      return res.end(buffer.slice(start, end + 1));
+    }
+    res.writeHead(200, { 'Content-Length': buffer.length, 'Content-Type': mime, 'Accept-Ranges': 'bytes' });
+    res.end(buffer);
+  } catch {
+    res.status(404).json({ error: 'not found' });
+  }
 });
 
 /* ------------------------------------------------------------------
@@ -298,4 +396,6 @@ app.get('/api/debug/gemini-models', async (_req, res) => {
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`));
+reelsService.initSchema()
+  .then(() => app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`)))
+  .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
