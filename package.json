@@ -2,17 +2,19 @@
   "name": "eduinsta-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "Payments, subscription verification and owner earnings API for EduInsta",
+  "description": "Reels, payments, OTP and moderation API for EduInsta",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "razorpay": "^2.9.4",
+    "multer": "^1.4.5-lts.1",
     "nodemailer": "^6.9.14",
-    "multer": "^1.4.5-lts.1"
+    "pg": "^8.12.0",
+    "razorpay": "^2.9.4"
   }
 }
