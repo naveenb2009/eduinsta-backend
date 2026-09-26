@@ -394,6 +394,97 @@ app.get('/api/debug/gemini-models', async (_req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------
+   SHAREABLE REEL LANDING PAGE — makes "Share" behave like Instagram/TikTok.
+
+   Sharing used to hand out the raw video file URL, which WhatsApp/Telegram
+   show as a bare "website link" and which just plays the file in a browser
+   — never opening the app. This page is what gets shared instead:
+
+     1. A messaging app's link-preview crawler (WhatsApp, Telegram, iMessage)
+        fetches this URL and reads the Open Graph tags below to build a rich
+        preview card (thumbnail + title), not a plain blue link.
+     2. On Android, if EduInsta is installed, Android's App Links system
+        intercepts this https:// URL BEFORE it reaches a browser (see the
+        intent-filter injected into AndroidManifest.xml + the
+        /.well-known/assetlinks.json route below) and opens the app
+        straight to this exact reel. This HTML is only ever actually
+        rendered as a fallback — someone without the app installed, or on
+        a platform without App Links support.
+   ------------------------------------------------------------------ */
+function escapeHtmlText(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+app.get('/reel/:id', async (req, res) => {
+  try {
+    const row = await reelsService.getReel(req.params.id);
+    if (!row) return res.status(404).send('This reel is no longer available.');
+    const r = reelsService.toClientReel(row);
+    const title = escapeHtmlText(`${r.title} — EduInsta`);
+    const desc = escapeHtmlText(r.desc || `${r.creator} on EduInsta`);
+    const origin = `${req.protocol}://${req.get('host')}`;
+    // og:video / <video src> must be an ABSOLUTE url — WhatsApp/Telegram's
+    // preview crawlers (and most players) won't resolve a relative one the
+    // way the app's own resolveMediaUrl() does client-side.
+    const rawSrc = r.src && /^https?:/i.test(r.src) ? r.src : (r.src ? `${origin}${r.src.startsWith('/') ? '' : '/'}${r.src}` : '');
+    const videoUrl = rawSrc ? escapeHtmlText(rawSrc) : '';
+    const pageUrl = escapeHtmlText(`${origin}/reel/${r.id}`);
+    const appLink = `eduinsta://reel/${encodeURIComponent(r.id)}`;
+    res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${desc}">
+<meta property="og:type" content="video.other">
+<meta property="og:url" content="${pageUrl}">
+${videoUrl ? `<meta property="og:video" content="${videoUrl}">\n<meta property="og:video:type" content="video/mp4">\n<meta name="twitter:card" content="player">` : ''}
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#05070c;color:#fff;text-align:center;padding:40px 20px;margin:0}
+video{max-width:360px;width:100%;border-radius:16px;margin-top:20px}
+a.btn{display:inline-block;margin-top:20px;padding:12px 24px;border-radius:24px;background:linear-gradient(135deg,#5eead4,#38bdf8);color:#05070c;text-decoration:none;font-weight:600}
+p.muted{color:#9aa4b8}</style>
+</head><body>
+<h2>${title}</h2>
+<p class="muted">${desc}</p>
+<a class="btn" href="${appLink}">Open in EduInsta</a>
+<p class="muted" style="margin-top:14px">Don't have the app? <a href="https://play.google.com/store/apps/details?id=com.eduinsta.app" style="color:#5eead4">Get it on Google Play</a></p>
+${videoUrl ? `<video src="${videoUrl}" controls playsinline></video>` : ''}
+<script>
+  // If EduInsta is installed but Android's App Link verification hasn't
+  // kicked in yet on this device, the button above still opens the app via
+  // its custom URL scheme. Never auto-redirect - some browsers show a scary
+  // warning dialog for that, so this stays a deliberate tap.
+</script>
+</body></html>`);
+  } catch (err) {
+    console.error('reel landing page failed:', err);
+    res.status(500).send('Something went wrong loading this reel.');
+  }
+});
+
+/* Android App Links verification file. Confirms to Android that WE, the
+   owner of this domain, authorize com.eduinsta.app to auto-open
+   https://<this host>/reel/* links directly instead of a browser.
+   Must be served at exactly this path as JSON (res.json sets that). */
+const APP_LINK_CERT_FINGERPRINTS = [
+  '9A:45:51:3A:45:A5:56:F1:02:6B:E0:1B:34:1A:C6:3A:2F:06:8A:40:B4:1D:49:50:CE:F8:0E:71:4C:AF:D3:42',
+];
+app.get('/.well-known/assetlinks.json', (_req, res) => {
+  res.json([
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.eduinsta.app',
+        sha256_cert_fingerprints: APP_LINK_CERT_FINGERPRINTS,
+      },
+    },
+  ]);
+});
+
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 reelsService.initSchema()
