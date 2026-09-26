@@ -52,7 +52,7 @@ async function storeVideo(buffer, mimeType) {
 
   if (!HAS_R2) {
     memoryVideos.set(key, { buffer, mime: mimeType || 'video/mp4' });
-    return { key, url: `/api/video/${encodeURIComponent(key)}` };
+    return { key, url: publicUrlFor(key) };
   }
 
   const { PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -64,9 +64,23 @@ async function storeVideo(buffer, mimeType) {
     CacheControl: 'public, max-age=31536000, immutable',
   }));
 
-  // Serve through the public R2/CDN domain if configured, else proxy via us.
-  const base = process.env.R2_PUBLIC_URL;
-  return { key, url: base ? `${base.replace(/\/$/, '')}/${key}` : `/api/video/${encodeURIComponent(key)}` };
+  return { key, url: publicUrlFor(key) };
+}
+
+/* Build the URL a client should fetch the video from.
+   Order of preference:
+     1. R2_PUBLIC_URL  - the bucket's own CDN domain (fastest, no server load)
+     2. PUBLIC_BASE_URL- this server's absolute address
+     3. relative path  - last resort; the app resolves it against API_BASE
+   A RELATIVE path is dangerous for native apps: inside a Capacitor WebView the
+   page origin is localhost, so "/api/video/x" resolves to https://localhost/...
+   and the video silently fails to load. Always prefer an absolute URL. */
+function publicUrlFor(key) {
+  const cdn = process.env.R2_PUBLIC_URL;
+  if (cdn) return `${cdn.replace(/\/$/, '')}/${key}`;
+  const self = process.env.PUBLIC_BASE_URL;
+  if (self) return `${self.replace(/\/$/, '')}/api/video/${encodeURIComponent(key)}`;
+  return `/api/video/${encodeURIComponent(key)}`;
 }
 
 async function readVideo(key) {
@@ -254,6 +268,18 @@ async function deleteReel(reelId, creator) {
   return true;
 }
 
+/* Fetch a single published reel by id - used by the /reel/:id shareable
+   landing page (Open Graph preview + Android App Link target). */
+async function getReel(reelId) {
+  if (!HAS_DB) {
+    return memoryReels.find((r) => String(r.id) === String(reelId)) || null;
+  }
+  const { rows } = await getPool().query(
+    `SELECT * FROM reels WHERE id = $1 AND status = 'published'`, [reelId]
+  );
+  return rows[0] || null;
+}
+
 /* Shape rows the way the app already expects, so the client barely changes. */
 function toClientReel(row) {
   return {
@@ -271,7 +297,7 @@ function toClientReel(row) {
 }
 
 module.exports = {
-  initSchema, storeVideo, readVideo, createReel, listReels,
+  initSchema, storeVideo, readVideo, createReel, listReels, getReel,
   toggleLike, incrementViews, deleteReel, toClientReel,
   HAS_R2, HAS_DB,
 };
