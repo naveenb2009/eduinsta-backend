@@ -496,6 +496,24 @@ async function getReel(reelId) {
   return rows[0] || null;
 }
 
+/* Fetch several reels by id in one call - used by the profile page's Saved
+   and Watch history tabs, which only have a list of ids (from the user's own
+   local storage) and need the full reel objects to render, regardless of
+   whether those reels are still on the first page of the main feed. */
+async function getReelsByIds(ids) {
+  const numeric = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!numeric.length) return [];
+
+  if (!HAS_DB) {
+    const wanted = new Set(numeric.map(String));
+    return memoryReels.filter((r) => wanted.has(String(r.id)));
+  }
+  const { rows } = await getPool().query(
+    `SELECT * FROM reels WHERE id = ANY($1::bigint[]) AND status = 'published'`, [numeric]
+  );
+  return rows;
+}
+
 /* Shape rows the way the app already expects, so the client barely changes. */
 function toClientReel(row) {
   return {
@@ -513,7 +531,7 @@ function toClientReel(row) {
 }
 
 module.exports = {
-  initSchema, storeVideo, readVideo, createReel, listReels, getReel,
+  initSchema, storeVideo, readVideo, createReel, listReels, getReel, getReelsByIds,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   storeImage, setAvatar, getAvatars, deleteAvatar,
   addComment, listComments, deleteCommentsForReel, deleteCommentsByUser, toClientComment,
