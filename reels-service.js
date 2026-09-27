@@ -268,6 +268,26 @@ async function deleteReel(reelId, creator) {
   return true;
 }
 
+/* Deletes EVERY reel a user has ever uploaded, including their stored video
+   files -- used by account deletion (GDPR/Play Store "delete my data"
+   requirement), not by the normal single-reel delete flow above. */
+async function deleteAllReelsByCreator(creator) {
+  if (!HAS_DB) {
+    const mine = memoryReels.filter((x) => x.creator === creator);
+    for (const r of mine) await deleteVideo(r.video_key).catch(() => {});
+    const before = memoryReels.length;
+    for (let i = memoryReels.length - 1; i >= 0; i--) {
+      if (memoryReels[i].creator === creator) memoryReels.splice(i, 1);
+    }
+    return before - memoryReels.length;
+  }
+  const { rows } = await getPool().query(
+    'DELETE FROM reels WHERE creator=$1 RETURNING video_key', [creator]
+  );
+  for (const row of rows) await deleteVideo(row.video_key).catch(() => {});
+  return rows.length;
+}
+
 /* Fetch a single published reel by id - used by the /reel/:id shareable
    landing page (Open Graph preview + Android App Link target). */
 async function getReel(reelId) {
@@ -298,6 +318,6 @@ function toClientReel(row) {
 
 module.exports = {
   initSchema, storeVideo, readVideo, createReel, listReels, getReel,
-  toggleLike, incrementViews, deleteReel, toClientReel,
+  toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   HAS_R2, HAS_DB,
 };
