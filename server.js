@@ -36,6 +36,7 @@ const Razorpay = require('razorpay');
 const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
 const reelsService = require('./reels-service');
+const diagnosticsService = require('./diagnostics-service');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
@@ -105,6 +106,71 @@ app.post('/api/verify-otp', (req, res) => {
   const result = verifyOtp(target, code);
   res.status(result.ok ? 200 : 400).json(result);
 });
+
+
+/* ------------------------------------------------------------------
+   DIAGNOSTICS — crash logs, generic errors, and basic performance timing
+   reported by the client (see diagnostics-service.js for why this exists
+   instead of Firebase Crashlytics). Accepts one event per call, silently
+   rate-limited per user so a runaway client-side error loop can't spam it.
+   ------------------------------------------------------------------ */
+app.post('/api/diagnostics', async (req, res) => {
+  try {
+    const { type, message, stack, context, userId, appVersion, platform } = req.body || {};
+    const result = await diagnosticsService.logEvent({ type, message, stack, context, userId, appVersion, platform });
+    res.json(result);
+  } catch (err) {
+    // Deliberately don't 500 here — a broken diagnostics call must never
+    // itself surface as an error the user (or another diagnostics report)
+    // has to deal with.
+    res.json({ ok: false });
+  }
+});
+
+/* Read-only viewer for you, not the app. Protected by a shared secret
+   (DIAGNOSTICS_ACCESS_KEY) rather than a login, since there's no admin auth
+   system in this backend. Leave the env var unset to disable it entirely.
+   ?format=json for raw data, otherwise a small readable HTML table. */
+app.get('/diagnostics', async (req, res) => {
+  const key = process.env.DIAGNOSTICS_ACCESS_KEY;
+  if (!key) return res.status(404).send('Not found');
+  if (req.query.key !== key) return res.status(403).send('Forbidden — wrong or missing ?key=');
+
+  const events = await diagnosticsService.listEvents({ limit: req.query.limit, type: req.query.type || null });
+  if (req.query.format === 'json') return res.json({ ok: true, events });
+
+  const rowsHtml = events.map((e) => `
+    <tr>
+      <td>${new Date(e.created_at).toLocaleString()}</td>
+      <td><span class="tag tag-${escapeHtmlSrv(e.type)}">${escapeHtmlSrv(e.type)}</span></td>
+      <td>${escapeHtmlSrv(e.user_id || '—')}</td>
+      <td>${escapeHtmlSrv(e.message || '')}</td>
+      <td><code>${escapeHtmlSrv(e.app_version || '—')} · ${escapeHtmlSrv(e.platform || '—')}</code></td>
+      <td>${e.stack ? `<details><summary>stack</summary><pre>${escapeHtmlSrv(e.stack)}</pre></details>` : ''}${e.context ? `<details><summary>context</summary><pre>${escapeHtmlSrv(e.context)}</pre></details>` : ''}</td>
+    </tr>`).join('');
+
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EduInsta diagnostics</title>
+    <style>
+      body{font-family:system-ui,sans-serif;background:#0d0f10;color:#e8e6e1;padding:24px;margin:0}
+      h1{font-size:1.2rem;margin:0 0 4px} .sub{color:#9b9689;font-size:.85rem;margin:0 0 20px}
+      table{width:100%;border-collapse:collapse;font-size:.82rem}
+      th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #262420;vertical-align:top}
+      th{color:#9b9689;font-weight:600;text-transform:uppercase;font-size:.7rem}
+      .tag{padding:2px 8px;border-radius:99px;font-size:.72rem;font-weight:600}
+      .tag-crash{background:#3a1a17;color:#ff6b60} .tag-error{background:#3a2e17;color:#ffb86b} .tag-performance{background:#173630;color:#5eead4}
+      pre{white-space:pre-wrap;word-break:break-word;font-size:.75rem;color:#c9c5b8;max-width:480px}
+      code{color:#9b9689}
+    </style></head><body>
+    <h1>EduInsta diagnostics</h1>
+    <p class="sub">${events.length} most recent event${events.length===1?'':'s'}. Filter with ?type=crash|error|performance, ?limit=N.</p>
+    <table><thead><tr><th>Time</th><th>Type</th><th>User</th><th>Message</th><th>Version</th><th>Details</th></tr></thead>
+    <tbody>${rowsHtml || '<tr><td colspan="6">No events yet.</td></tr>'}</tbody></table>
+    </body></html>`);
+});
+function escapeHtmlSrv(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 
 /* ------------------------------------------------------------------
@@ -698,6 +764,6 @@ app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_H
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-reelsService.initSchema()
+Promise.all([reelsService.initSchema(), diagnosticsService.initSchema()])
   .then(() => app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`)))
   .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
