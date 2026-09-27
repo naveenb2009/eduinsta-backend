@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delete your EduInsta account</title>
+<style>
+:root{
+  --bg:#faf9f7; --surface:#ffffff; --text:#1c1a17; --text-dim:#5c574e;
+  --border:#e6e2da; --accent:#0f6e5e; --accent-soft:#e4f2ee; --danger:#b3261e; --danger-soft:#fbe9e7;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#15140f; --surface:#1c1a15; --text:#f3f1ea; --text-dim:#b3ada0;
+    --border:#332f27; --accent:#5eead4; --accent-soft:#173630; --danger:#ff6b60; --danger-soft:#3a1a17;
+    color-scheme: dark;
+  }
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--text); margin:0;
+  font-family:"Source Serif 4",Georgia,serif;
+  padding:48px 20px;
+  display:flex; justify-content:center;
+}
+.page{max-width:520px; width:100%}
+h1{
+  font-family:"Inter",system-ui,sans-serif; font-weight:700;
+  font-size:clamp(1.5rem,4vw,1.9rem); letter-spacing:-0.01em;
+  margin:0 0 8px;
+}
+p.lede{line-height:1.6; color:var(--text-dim); margin:0 0 28px}
+.card{
+  background:var(--surface); border:1px solid var(--border); border-radius:12px;
+  padding:24px; margin-bottom:16px;
+}
+.card h2{
+  font-family:"Inter",system-ui,sans-serif; font-weight:600; font-size:0.95rem;
+  margin:0 0 6px;
+}
+.card p.hint{
+  font-family:"Inter",system-ui,sans-serif; font-size:0.85rem; color:var(--text-dim);
+  margin:0 0 16px; line-height:1.5;
+}
+label{
+  display:block; font-family:"Inter",system-ui,sans-serif; font-size:0.85rem;
+  font-weight:600; margin:0 0 6px;
+}
+input[type=email],input[type=text]{
+  width:100%; font-family:"Inter",system-ui,sans-serif; font-size:0.95rem;
+  padding:11px 12px; border-radius:8px; border:1px solid var(--border);
+  background:var(--bg); color:var(--text); margin:0 0 14px;
+}
+input:focus{outline:2px solid var(--accent); outline-offset:1px}
+button{
+  width:100%; font-family:"Inter",system-ui,sans-serif; font-weight:600; font-size:0.95rem;
+  padding:12px; border-radius:8px; border:none; cursor:pointer;
+  background:var(--accent); color:var(--bg);
+}
+button:disabled{opacity:0.55; cursor:not-allowed}
+button.danger{background:var(--danger); color:#fff}
+button.ghost{
+  background:transparent; color:var(--text-dim); border:1px solid var(--border);
+  margin-top:8px;
+}
+.msg{
+  font-family:"Inter",system-ui,sans-serif; font-size:0.85rem; line-height:1.5;
+  border-radius:8px; padding:10px 12px; margin:0 0 14px; display:none;
+}
+.msg.show{display:block}
+.msg.error{background:var(--danger-soft); color:var(--danger)}
+.msg.ok{background:var(--accent-soft); color:var(--accent)}
+.warn{
+  font-family:"Inter",system-ui,sans-serif; font-size:0.82rem; line-height:1.55;
+  color:var(--text-dim); margin:14px 0 0;
+}
+.step{display:none}
+.step.active{display:block}
+footer{
+  margin-top:28px; font-family:"Inter",system-ui,sans-serif; font-size:0.78rem;
+  color:var(--text-dim); text-align:center;
+}
+footer a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Delete your EduInsta account</h1>
+  <p class="lede">This permanently removes your account, uploaded videos, subscription record, and personal data from EduInsta. You don't need the app installed to do this — verify your email below and confirm.</p>
+
+  <div class="card">
+    <div id="step1" class="step active">
+      <h2>1. Verify your email</h2>
+      <p class="hint">Enter the email address your EduInsta account uses. We'll send a one-time code to confirm it's you.</p>
+      <div id="msg1" class="msg error"></div>
+      <label for="email">Email address</label>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
+      <button id="sendCodeBtn" type="button">Send verification code</button>
+    </div>
+
+    <div id="step2" class="step">
+      <h2>2. Enter the code</h2>
+      <p class="hint">We sent a code to <span id="emailEcho"></span>. It expires shortly, so enter it soon.</p>
+      <div id="msg2" class="msg error"></div>
+      <label for="code">Verification code</label>
+      <input type="text" id="code" inputmode="numeric" placeholder="6-digit code" autocomplete="one-time-code">
+      <button id="deleteBtn" type="button" class="danger">Permanently delete my account</button>
+      <button id="backBtn" type="button" class="ghost">Use a different email</button>
+      <p class="warn">This cannot be undone. Your uploaded videos, subscription status, and account data will be permanently removed.</p>
+    </div>
+
+    <div id="step3" class="step">
+      <h2>Account deleted</h2>
+      <div id="msg3" class="msg ok show">Your EduInsta account and associated data have been deleted.</div>
+      <p class="hint">If you change your mind, you're welcome to create a new account any time.</p>
+    </div>
+  </div>
+
+  <footer>Questions? Contact <a href="mailto:naveen.b2009@gmail.com">naveen.b2009@gmail.com</a> &middot; See our <a href="/privacy">Privacy Policy</a>.</footer>
+</div>
+
+<script>
+(function(){
+  var email = '';
+  var step1 = document.getElementById('step1');
+  var step2 = document.getElementById('step2');
+  var step3 = document.getElementById('step3');
+  var msg1 = document.getElementById('msg1');
+  var msg2 = document.getElementById('msg2');
+  var emailInput = document.getElementById('email');
+  var codeInput = document.getElementById('code');
+  var sendCodeBtn = document.getElementById('sendCodeBtn');
+  var deleteBtn = document.getElementById('deleteBtn');
+  var backBtn = document.getElementById('backBtn');
+
+  function showMsg(el, text){
+    el.textContent = text;
+    el.classList.add('show');
+  }
+  function hideMsg(el){
+    el.textContent = '';
+    el.classList.remove('show');
+  }
+
+  sendCodeBtn.addEventListener('click', function(){
+    hideMsg(msg1);
+    var value = (emailInput.value || '').trim();
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)){
+      showMsg(msg1, 'Enter a valid email address.');
+      return;
+    }
+    email = value;
+    sendCodeBtn.disabled = true;
+    sendCodeBtn.textContent = 'Sending…';
+    fetch('/api/send-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: email, channel: 'email' })
+    }).then(function(r){ return r.json(); }).then(function(result){
+      sendCodeBtn.disabled = false;
+      sendCodeBtn.textContent = 'Send verification code';
+      if(!result.ok){
+        showMsg(msg1, result.error || 'Could not send a code. Try again in a moment.');
+        return;
+      }
+      document.getElementById('emailEcho').textContent = email;
+      step1.classList.remove('active');
+      step2.classList.add('active');
+    }).catch(function(){
+      sendCodeBtn.disabled = false;
+      sendCodeBtn.textContent = 'Send verification code';
+      showMsg(msg1, 'Network error — please try again.');
+    });
+  });
+
+  backBtn.addEventListener('click', function(){
+    hideMsg(msg2);
+    codeInput.value = '';
+    step2.classList.remove('active');
+    step1.classList.add('active');
+  });
+
+  deleteBtn.addEventListener('click', function(){
+    hideMsg(msg2);
+    var code = (codeInput.value || '').trim();
+    if(!code){
+      showMsg(msg2, 'Enter the verification code.');
+      return;
+    }
+    var confirmed = window.confirm('This permanently deletes your EduInsta account and all your data. This cannot be undone. Continue?');
+    if(!confirmed) return;
+
+    deleteBtn.disabled = true;
+    deleteBtn.textContent = 'Deleting…';
+    fetch('/api/request-account-deletion', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, code: code })
+    }).then(function(r){ return r.json(); }).then(function(result){
+      deleteBtn.disabled = false;
+      deleteBtn.textContent = 'Permanently delete my account';
+      if(!result.ok){
+        showMsg(msg2, result.error || 'That code didn\'t work. Check it and try again.');
+        return;
+      }
+      step2.classList.remove('active');
+      step3.classList.add('active');
+    }).catch(function(){
+      deleteBtn.disabled = false;
+      deleteBtn.textContent = 'Permanently delete my account';
+      showMsg(msg2, 'Network error — please try again.');
+    });
+  });
+})();
+</script>
+</body>
+</html>
