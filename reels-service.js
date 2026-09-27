@@ -67,6 +67,32 @@ async function storeVideo(buffer, mimeType) {
   return { key, url: publicUrlFor(key) };
 }
 
+/* Same idea as storeVideo, but for profile photos - kept as its own function
+   (rather than a shared prefix parameter) so the reel-upload path can't be
+   accidentally affected by changes made here. Reuses the same R2 client and
+   the same memory-mode map: keys are unique (prefixed "avatars/"), so there's
+   no collision with reel video keys. */
+async function storeImage(buffer, mimeType) {
+  const ext = (mimeType || 'image/jpeg').split('/')[1].replace(/[^a-z0-9]/gi, '') || 'jpg';
+  const key = `avatars/${Date.now()}_${crypto.randomBytes(8).toString('hex')}.${ext}`;
+
+  if (!HAS_R2) {
+    memoryVideos.set(key, { buffer, mime: mimeType || 'image/jpeg' });
+    return { key, url: publicUrlFor(key) };
+  }
+
+  const { PutObjectCommand } = require('@aws-sdk/client-s3');
+  await getS3().send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: mimeType || 'image/jpeg',
+    CacheControl: 'public, max-age=31536000, immutable',
+  }));
+
+  return { key, url: publicUrlFor(key) };
+}
+
 /* Build the URL a client should fetch the video from.
    Order of preference:
      1. R2_PUBLIC_URL  - the bucket's own CDN domain (fastest, no server load)
@@ -154,6 +180,24 @@ async function initSchema() {
       user_id  TEXT   NOT NULL,
       PRIMARY KEY (reel_id, user_id)
     );
+
+    CREATE TABLE IF NOT EXISTS profiles (
+      user_id     TEXT PRIMARY KEY,
+      avatar_key  TEXT,
+      avatar_url  TEXT,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS reel_comments (
+      id          BIGSERIAL PRIMARY KEY,
+      reel_id     BIGINT NOT NULL,
+      user_id     TEXT NOT NULL,
+      username    TEXT,
+      text        TEXT NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS reel_comments_reel_idx ON reel_comments (reel_id, id);
+    CREATE INDEX IF NOT EXISTS reel_comments_user_idx ON reel_comments (user_id);
   `);
   if (!HAS_R2) console.warn('⚠️  No R2 configured — videos are held in memory and lost on restart.');
 }
@@ -258,6 +302,7 @@ async function deleteReel(reelId, creator) {
     if (i < 0) return false;
     await deleteVideo(memoryReels[i].video_key).catch(() => {});
     memoryReels.splice(i, 1);
+    await deleteCommentsForReel(reelId).catch(() => {});
     return true;
   }
   const { rows } = await getPool().query(
@@ -265,6 +310,7 @@ async function deleteReel(reelId, creator) {
   );
   if (!rows.length) return false;
   await deleteVideo(rows[0].video_key).catch(() => {});
+  await deleteCommentsForReel(reelId).catch(() => {});
   return true;
 }
 
@@ -274,7 +320,10 @@ async function deleteReel(reelId, creator) {
 async function deleteAllReelsByCreator(creator) {
   if (!HAS_DB) {
     const mine = memoryReels.filter((x) => x.creator === creator);
-    for (const r of mine) await deleteVideo(r.video_key).catch(() => {});
+    for (const r of mine) {
+      await deleteVideo(r.video_key).catch(() => {});
+      await deleteCommentsForReel(r.id).catch(() => {});
+    }
     const before = memoryReels.length;
     for (let i = memoryReels.length - 1; i >= 0; i--) {
       if (memoryReels[i].creator === creator) memoryReels.splice(i, 1);
@@ -282,10 +331,157 @@ async function deleteAllReelsByCreator(creator) {
     return before - memoryReels.length;
   }
   const { rows } = await getPool().query(
-    'DELETE FROM reels WHERE creator=$1 RETURNING video_key', [creator]
+    'DELETE FROM reels WHERE creator=$1 RETURNING id, video_key', [creator]
   );
-  for (const row of rows) await deleteVideo(row.video_key).catch(() => {});
+  for (const row of rows) {
+    await deleteVideo(row.video_key).catch(() => {});
+    await deleteCommentsForReel(row.id).catch(() => {});
+  }
   return rows.length;
+}
+
+/* ------------------------------------------------------------------
+   Profile photos — shared server-side so other users can actually see
+   them (previously the photo only lived in the uploader's own browser
+   storage, so nobody else could ever see it).
+   ------------------------------------------------------------------ */
+const memoryProfiles = new Map();   // userId -> { avatarKey, avatarUrl }  (memory mode)
+
+async function getAvatarRecord(userId) {
+  if (!HAS_DB) return memoryProfiles.get(userId) || null;
+  const { rows } = await getPool().query(
+    'SELECT avatar_key, avatar_url FROM profiles WHERE user_id=$1', [userId]
+  );
+  if (!rows.length) return null;
+  return { avatarKey: rows[0].avatar_key, avatarUrl: rows[0].avatar_url };
+}
+
+/* Uploads the new photo, points the user's profile row at it, then removes
+   the OLD photo file (if any) so replaced avatars don't pile up in storage. */
+async function setAvatar(userId, buffer, mimeType) {
+  const old = await getAvatarRecord(userId);
+  const { key, url } = await storeImage(buffer, mimeType);
+
+  if (!HAS_DB) {
+    memoryProfiles.set(userId, { avatarKey: key, avatarUrl: url });
+  } else {
+    await getPool().query(
+      `INSERT INTO profiles (user_id, avatar_key, avatar_url, updated_at)
+       VALUES ($1,$2,$3, now())
+       ON CONFLICT (user_id) DO UPDATE SET avatar_key=$2, avatar_url=$3, updated_at=now()`,
+      [userId, key, url]
+    );
+  }
+
+  if (old?.avatarKey && old.avatarKey !== key) await deleteVideo(old.avatarKey).catch(() => {});
+  return url;
+}
+
+/* Batch lookup - the feed calls this once per page with every creator id it
+   needs, rather than one request per reel. */
+async function getAvatars(userIds) {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  if (!ids.length) return {};
+
+  if (!HAS_DB) {
+    const out = {};
+    ids.forEach((id) => {
+      const r = memoryProfiles.get(id);
+      if (r) out[id] = r.avatarUrl;
+    });
+    return out;
+  }
+
+  const { rows } = await getPool().query(
+    'SELECT user_id, avatar_url FROM profiles WHERE user_id = ANY($1)', [ids]
+  );
+  const out = {};
+  rows.forEach((r) => { out[r.user_id] = r.avatar_url; });
+  return out;
+}
+
+async function deleteAvatar(userId) {
+  const rec = await getAvatarRecord(userId);
+  if (!rec) return;
+  if (rec.avatarKey) await deleteVideo(rec.avatarKey).catch(() => {});
+  if (!HAS_DB) { memoryProfiles.delete(userId); return; }
+  await getPool().query('DELETE FROM profiles WHERE user_id=$1', [userId]);
+}
+
+/* ------------------------------------------------------------------
+   Comments — now shared server-side so a comment posted by one user is
+   visible to everyone viewing that reel (previously kept in the poster's
+   own browser storage only, so nobody else could ever see it). Still
+   unmoderated, same as before — this only changes WHERE comments live,
+   not whether they're reviewed before appearing.
+   ------------------------------------------------------------------ */
+const MAX_COMMENT_LENGTH = 300;
+const memoryComments = new Map();   // String(reelId) -> [{id,reel_id,user_id,username,text,created_at}]
+
+async function addComment(reelId, userId, username, text) {
+  const clean = String(text || '').trim().slice(0, MAX_COMMENT_LENGTH);
+  if (!clean) throw new Error('Comment text is required');
+  if (!userId) throw new Error('userId is required');
+
+  if (!HAS_DB) {
+    const row = {
+      id: nextMemoryId(), reel_id: reelId, user_id: userId,
+      username: username || userId, text: clean, created_at: new Date().toISOString(),
+    };
+    const arr = memoryComments.get(String(reelId)) || [];
+    arr.push(row);
+    memoryComments.set(String(reelId), arr);
+    return row;
+  }
+
+  const { rows } = await getPool().query(
+    `INSERT INTO reel_comments (reel_id, user_id, username, text) VALUES ($1,$2,$3,$4) RETURNING *`,
+    [reelId, userId, username || userId, clean]
+  );
+  return rows[0];
+}
+
+/* Oldest-first, capped — matches how the app already renders them (each
+   new comment appended to the bottom of the list). */
+async function listComments(reelId, { limit = 200 } = {}) {
+  const lim = Math.min(300, Math.max(1, Number(limit) || 200));
+
+  if (!HAS_DB) {
+    const arr = memoryComments.get(String(reelId)) || [];
+    return arr.slice(-lim);
+  }
+
+  const { rows } = await getPool().query(
+    `SELECT * FROM reel_comments WHERE reel_id=$1 ORDER BY id ASC LIMIT $2`, [reelId, lim]
+  );
+  return rows;
+}
+
+async function deleteCommentsForReel(reelId) {
+  if (!HAS_DB) { memoryComments.delete(String(reelId)); return; }
+  await getPool().query('DELETE FROM reel_comments WHERE reel_id=$1', [reelId]);
+}
+
+/* Removes every comment a user has ever POSTED, including on other
+   people's reels -- used by account deletion. (Comments ON their own
+   reels are already covered by deleteCommentsForReel via deleteReel /
+   deleteAllReelsByCreator.) */
+async function deleteCommentsByUser(userId) {
+  if (!HAS_DB) {
+    let removed = 0;
+    for (const [key, arr] of memoryComments) {
+      const kept = arr.filter((c) => c.user_id !== userId);
+      removed += arr.length - kept.length;
+      memoryComments.set(key, kept);
+    }
+    return removed;
+  }
+  const { rowCount } = await getPool().query('DELETE FROM reel_comments WHERE user_id=$1', [userId]);
+  return rowCount;
+}
+
+function toClientComment(row) {
+  return { id: Number(row.id), user: row.username || row.user_id, text: row.text, createdAt: row.created_at };
 }
 
 /* Fetch a single published reel by id - used by the /reel/:id shareable
@@ -319,5 +515,7 @@ function toClientReel(row) {
 module.exports = {
   initSchema, storeVideo, readVideo, createReel, listReels, getReel,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
+  storeImage, setAvatar, getAvatars, deleteAvatar,
+  addComment, listComments, deleteCommentsForReel, deleteCommentsByUser, toClientComment,
   HAS_R2, HAS_DB,
 };
