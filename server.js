@@ -29,6 +29,8 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const cors = require('cors');
 const Razorpay = require('razorpay');
 const { requestOtp, verifyOtp } = require('./otp-service');
@@ -535,6 +537,15 @@ app.get('/.well-known/assetlinks.json', (_req, res) => {
     },
   ]);
 });
+
+/* ------------------------------------------------------------------
+   PRIVACY POLICY — required by Play Console (App content > Privacy
+   policy) and by RevenueCat/AdMob account setup. Read from disk once at
+   startup and cached in memory; edit privacy-policy.html and redeploy to
+   update it, no code change needed here.
+   ------------------------------------------------------------------ */
+const PRIVACY_POLICY_HTML = fs.readFileSync(path.join(__dirname, 'privacy-policy.html'), 'utf8');
+app.get('/privacy', (_req, res) => res.type('html').send(PRIVACY_POLICY_HTML));
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
