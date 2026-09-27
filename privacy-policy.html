@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EduInsta Privacy Policy</title>
+<style>
+:root{
+  --bg:#faf9f7; --surface:#ffffff; --text:#1c1a17; --text-dim:#5c574e;
+  --border:#e6e2da; --accent:#0f6e5e; --accent-soft:#e4f2ee;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#15140f; --surface:#1c1a15; --text:#f3f1ea; --text-dim:#b3ada0;
+    --border:#332f27; --accent:#5eead4; --accent-soft:#173630;
+    color-scheme: dark;
+  }
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--text); margin:0;
+  font-family:"Source Serif 4",Georgia,serif;
+  padding:48px 20px;
+  display:flex; justify-content:center;
+}
+.page{max-width:720px; width:100%}
+h1{
+  font-family:"Inter",system-ui,sans-serif; font-weight:700;
+  font-size:clamp(1.6rem,4vw,2.1rem); letter-spacing:-0.01em;
+  margin:0 0 4px;
+}
+.effective{
+  font-family:"Inter",system-ui,sans-serif; font-size:0.85rem;
+  color:var(--text-dim); margin:0 0 32px;
+}
+h2{
+  font-family:"Inter",system-ui,sans-serif; font-weight:600;
+  font-size:1.05rem; margin:40px 0 12px; padding-top:20px;
+  border-top:1px solid var(--border);
+}
+h2:first-of-type{border-top:none; padding-top:0}
+p{line-height:1.65; margin:0 0 14px; color:var(--text)}
+ul{margin:0 0 14px; padding-left:22px; line-height:1.65}
+li{margin-bottom:6px}
+table{width:100%; border-collapse:collapse; font-size:0.92rem; margin:0 0 16px}
+th,td{
+  text-align:left; padding:9px 10px; border-bottom:1px solid var(--border);
+  font-family:"Inter",system-ui,sans-serif; vertical-align:top;
+}
+th{color:var(--text-dim); font-weight:600; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.03em}
+.contact{
+  font-family:"Inter",system-ui,sans-serif; font-size:0.95rem;
+  background:var(--surface); border:1px solid var(--border); border-radius:10px;
+  padding:18px 20px; margin-top:36px;
+}
+.contact a{color:var(--accent)}
+footer{
+  margin-top:40px; font-family:"Inter",system-ui,sans-serif; font-size:0.78rem;
+  color:var(--text-dim);
+}
+@media (max-width:480px){
+  table, thead, tbody, th, td, tr{display:block}
+  th{display:none}
+  td{border-bottom:none; padding:4px 0}
+  tr{padding:10px 0; border-bottom:1px solid var(--border)}
+  td:first-child{font-weight:600; font-family:"Inter",system-ui,sans-serif}
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>EduInsta Privacy Policy</h1>
+  <p class="effective">Effective date: 27 September 2026</p>
+
+  <p>EduInsta ("we", "our", "the app") is an educational short-video app. This policy explains what information we collect, why, and how it's handled. EduInsta is intended for users aged 13 and older.</p>
+
+  <h2>Information we collect</h2>
+  <table>
+    <thead><tr><th>Data</th><th>Why we collect it</th></tr></thead>
+    <tbody>
+      <tr><td>Email address</td><td>Account creation and sign-in, sent as a one-time verification code (OTP)</td></tr>
+      <tr><td>Name &amp; username</td><td>Displayed on your profile and uploaded content</td></tr>
+      <tr><td>Videos you upload</td><td>To publish your content in the app's feed; automatically screened for educational relevance before publishing</td></tr>
+      <tr><td>Subscription status</td><td>To determine whether your account has an active ad-free Premium subscription</td></tr>
+      <tr><td>Advertising identifiers</td><td>Used by Google AdMob to serve and measure ads (not used if you have Premium)</td></tr>
+    </tbody>
+  </table>
+
+  <p>We do <strong>not</strong> collect or store payment card numbers, UPI IDs, or bank details. Premium subscription payments are processed entirely by Google Play Billing; advertiser payments are processed by Razorpay. We never see or store your payment credentials.</p>
+
+  <h2>How we use your information</h2>
+  <ul>
+    <li>To create and secure your account, and verify it's really you via OTP</li>
+    <li>To show your uploaded videos to other users in the app</li>
+    <li>To screen uploaded videos for educational relevance before they're published</li>
+    <li>To determine your subscription status and whether ads should be shown</li>
+    <li>To serve relevant advertising, unless you're a Premium subscriber</li>
+  </ul>
+
+  <h2>Third parties we share data with</h2>
+  <table>
+    <thead><tr><th>Service</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>Google Play Billing / RevenueCat</td><td>Processing Premium subscription payments</td></tr>
+      <tr><td>Razorpay</td><td>Processing advertiser ad-campaign payments</td></tr>
+      <tr><td>Google AdMob</td><td>Serving in-app advertising</td></tr>
+      <tr><td>Google Gemini API</td><td>Automated screening of uploaded videos for educational content</td></tr>
+      <tr><td>Cloudflare R2</td><td>Storing uploaded video files</td></tr>
+      <tr><td>Neon (Postgres)</td><td>Storing account and video metadata</td></tr>
+    </tbody>
+  </table>
+  <p>We do not sell your personal information to third parties.</p>
+
+  <h2>Children's privacy</h2>
+  <p>EduInsta requires users to confirm they are 13 years of age or older at sign-up. We do not knowingly collect information from children under 13. If we become aware that a user under 13 has created an account, we will take steps to delete that account and associated data.</p>
+
+  <h2>Data retention &amp; deletion</h2>
+  <p>We retain your account information and uploaded content for as long as your account is active. You can request deletion of your account and associated data by contacting us using the details below.</p>
+
+  <h2>Security</h2>
+  <p>OTP codes are hashed before storage and never transmitted back to the app. Payment processing is handled entirely by Google Play Billing and Razorpay — we never receive or store your card, UPI, or bank details.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>We may update this policy from time to time. Material changes will be reflected by updating the effective date above.</p>
+
+  <div class="contact">
+    Questions about this policy or your data? Contact us at
+    <a href="mailto:naveen.b2009@gmail.com">naveen.b2009@gmail.com</a>.
+  </div>
+
+  <footer>EduInsta — this page is the privacy policy referenced in the app's Google Play Store listing.</footer>
+</div>
+</body>
+</html>
