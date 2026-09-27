@@ -201,6 +201,76 @@ app.delete('/api/reels/:id', async (req, res) => {
   }
 });
 
+/* Comments — shared server-side so everyone viewing a reel sees the same
+   list, not just the person who posted them. Still unmoderated (no change
+   from before — see the education-check moderation above, which only
+   screens VIDEOS, never comment text). */
+app.post('/api/reels/:id/comments', async (req, res) => {
+  try {
+    const { userId, username, text } = req.body || {};
+    if (!userId || !text) return res.status(400).json({ ok: false, error: 'userId and text are required' });
+    const row = await reelsService.addComment(req.params.id, userId, username, text);
+    res.json({ ok: true, comment: reelsService.toClientComment(row) });
+  } catch (err) {
+    console.error('add comment failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not post the comment' });
+  }
+});
+
+app.get('/api/reels/:id/comments', async (req, res) => {
+  try {
+    const rows = await reelsService.listComments(req.params.id, { limit: req.query.limit });
+    res.json({ ok: true, comments: rows.map(reelsService.toClientComment) });
+  } catch (err) {
+    console.error('list comments failed:', err);
+    res.status(500).json({ ok: false, comments: [] });
+  }
+});
+
+/* ------------------------------------------------------------------
+   PROFILE PHOTOS — shared server-side (R2 + profiles table) so a user's
+   avatar is actually visible to OTHER users, not just stored locally on
+   their own device.
+   ------------------------------------------------------------------ */
+app.post('/api/profile/avatar', upload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'No image supplied' });
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
+    if (!req.file.mimetype.startsWith('image/')) {
+      return res.status(400).json({ ok: false, error: 'File must be an image' });
+    }
+    const avatarUrl = await reelsService.setAvatar(userId, req.file.buffer, req.file.mimetype);
+    res.json({ ok: true, avatarUrl });
+  } catch (err) {
+    console.error('avatar upload failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not upload photo' });
+  }
+});
+
+app.delete('/api/profile/avatar/:userId', async (req, res) => {
+  try {
+    await reelsService.deleteAvatar(req.params.userId);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('avatar delete failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not remove photo' });
+  }
+});
+
+/* Batch lookup - the feed asks for every creator id on the page in one call
+   rather than one request per reel. ?ids=a@x.com,b@y.com */
+app.get('/api/avatars', async (req, res) => {
+  try {
+    const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const avatars = await reelsService.getAvatars(ids);
+    res.json({ ok: true, avatars });
+  } catch (err) {
+    console.error('avatar lookup failed:', err);
+    res.status(500).json({ ok: false, avatars: {} });
+  }
+});
+
 /* Fallback video streaming for when no public R2 domain is configured.
    Supports Range requests, which video players require for seeking. */
 app.get('/api/video/:key', async (req, res) => {
@@ -343,6 +413,19 @@ async function performAccountDeletion(userId) {
   db.payments.forEach((p) => {
     if (p.userId === userId) p.userId = '[deleted-user]';
   });
+  try {
+    await reelsService.deleteAvatar(userId);
+  } catch (err) {
+    console.error('account deletion: failed to delete avatar for', userId, err);
+  }
+  try {
+    // Comments this user posted on OTHER people's reels. Comments on their
+    // OWN reels are removed as a side effect of deleteAllReelsByCreator
+    // below (deleting a reel cascades to its comments).
+    await reelsService.deleteCommentsByUser(userId);
+  } catch (err) {
+    console.error('account deletion: failed to delete comments for', userId, err);
+  }
   try {
     return await reelsService.deleteAllReelsByCreator(userId);
   } catch (err) {
