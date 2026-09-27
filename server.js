@@ -318,6 +318,61 @@ app.get('/api/subscription/:userId', (req, res) => {
 });
 
 /* ------------------------------------------------------------------
+   3b. DELETE ACCOUNT — Google Play requires any app with account creation
+   to offer in-app account + data deletion (not just a web form). Removes:
+     - the user's subscription record
+     - every reel/video they've uploaded (Postgres row + R2 file)
+   Payment ledger rows are ANONYMIZED rather than deleted (userId blanked,
+   amounts kept) — standard practice, since payment records often need to
+   be retained for accounting/tax purposes even after a user deletes their
+   account.
+
+   Two ways in, both landing here:
+     - DELETE /api/account/:userId — called from INSIDE the app (Settings >
+       Delete account). No extra verification needed: the user is already
+       authenticated on their own device (auth here is local to the
+       device, see index.html), which the app then clears immediately.
+     - POST /api/request-account-deletion — the public web page
+       (/delete-account) required by Play Store policy for users who no
+       longer have the app installed. Since there's no device session to
+       trust here, this path requires a fresh OTP (the same
+       send-otp/verify-otp flow used for sign-in) before deleting anything.
+   ------------------------------------------------------------------ */
+async function performAccountDeletion(userId) {
+  db.subscriptions.delete(userId);
+  db.payments.forEach((p) => {
+    if (p.userId === userId) p.userId = '[deleted-user]';
+  });
+  try {
+    return await reelsService.deleteAllReelsByCreator(userId);
+  } catch (err) {
+    console.error('account deletion: failed to delete reels for', userId, err);
+    // Continue rather than fail the whole request — subscription/payment
+    // cleanup above already succeeded, and the user should not be blocked
+    // from deleting their account by a storage hiccup.
+    return 0;
+  }
+}
+
+app.delete('/api/account/:userId', async (req, res) => {
+  const { userId } = req.params;
+  if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
+  const reelsDeleted = await performAccountDeletion(userId);
+  console.log(`Account deleted (in-app): ${userId} (${reelsDeleted} reel(s) removed)`);
+  res.json({ ok: true, reelsDeleted });
+});
+
+app.post('/api/request-account-deletion', async (req, res) => {
+  const { email, code } = req.body || {};
+  if (!email || !code) return res.status(400).json({ ok: false, error: 'email and code required' });
+  const result = verifyOtp(email, code);
+  if (!result.ok) return res.status(400).json(result);
+  const reelsDeleted = await performAccountDeletion(email);
+  console.log(`Account deleted (web request): ${email} (${reelsDeleted} reel(s) removed)`);
+  res.json({ ok: true, reelsDeleted });
+});
+
+/* ------------------------------------------------------------------
    4. RAZORPAY WEBHOOK — authoritative source for renewals/refunds.
    Configure this URL in your Razorpay dashboard.
    NOTE: needs the RAW body to verify the signature, so it is mounted
@@ -546,6 +601,17 @@ app.get('/.well-known/assetlinks.json', (_req, res) => {
    ------------------------------------------------------------------ */
 const PRIVACY_POLICY_HTML = fs.readFileSync(path.join(__dirname, 'privacy-policy.html'), 'utf8');
 app.get('/privacy', (_req, res) => res.type('html').send(PRIVACY_POLICY_HTML));
+
+/* ------------------------------------------------------------------
+   ACCOUNT DELETION PAGE — required by Play Console (App content >
+   Data safety / Account deletion) as a public, no-login-required way
+   to request account deletion. Same read-from-disk pattern as
+   /privacy above; the page itself calls /api/send-otp, /api/verify-otp
+   is skipped in favour of a single combined step at
+   /api/request-account-deletion (which does its own OTP check).
+   ------------------------------------------------------------------ */
+const DELETE_ACCOUNT_HTML = fs.readFileSync(path.join(__dirname, 'delete-account.html'), 'utf8');
+app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_HTML));
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
