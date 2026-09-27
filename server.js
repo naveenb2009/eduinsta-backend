@@ -37,6 +37,7 @@ const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
 const reelsService = require('./reels-service');
 const diagnosticsService = require('./diagnostics-service');
+const authService = require('./auth-service');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
@@ -105,6 +106,57 @@ app.post('/api/verify-otp', (req, res) => {
   if (!target || !code) return res.status(400).json({ ok: false, error: 'target and code required' });
   const result = verifyOtp(target, code);
   res.status(result.ok ? 200 : 400).json(result);
+});
+
+
+/* ------------------------------------------------------------------
+   ACCOUNTS — real, server-side signup/login (see auth-service.js for why
+   this exists: local-only "accounts" didn't survive an app reinstall).
+   The client only calls these AFTER its own OTP step has already been
+   verified against /api/verify-otp above, so these don't re-check it —
+   same trust boundary the rest of this backend already uses (e.g. the
+   forgot-password and phone-number-change flows).
+   ------------------------------------------------------------------ */
+app.post('/api/signup', async (req, res) => {
+  try {
+    const { name, email, phone, password } = req.body || {};
+    if (!name || !email || !password) {
+      return res.status(400).json({ ok: false, error: 'name, email and password are required' });
+    }
+    if (await authService.userExists(email)) {
+      return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
+    }
+    await authService.createUser({ email, name, phone, password });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('signup failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not create your account. Please try again.' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password are required' });
+    const result = await authService.verifyPassword(email, password);
+    if (result.ok) return res.json(result);
+    res.status(result.notFound ? 404 : 401).json(result);
+  } catch (err) {
+    console.error('login failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not sign in. Please try again.' });
+  }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body || {};
+    if (!email || !newPassword) return res.status(400).json({ ok: false, error: 'email and newPassword are required' });
+    const result = await authService.updatePassword(email, newPassword);
+    res.status(result.ok ? 200 : 404).json(result);
+  } catch (err) {
+    console.error('reset-password failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not reset your password. Please try again.' });
+  }
 });
 
 
@@ -495,6 +547,11 @@ async function performAccountDeletion(userId) {
     if (p.userId === userId) p.userId = '[deleted-user]';
   });
   try {
+    await authService.deleteUser(userId);
+  } catch (err) {
+    console.error('account deletion: failed to delete login credentials for', userId, err);
+  }
+  try {
     await reelsService.deleteAvatar(userId);
   } catch (err) {
     console.error('account deletion: failed to delete avatar for', userId, err);
@@ -779,6 +836,6 @@ app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_H
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-Promise.all([reelsService.initSchema(), diagnosticsService.initSchema()])
+Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema()])
   .then(() => app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`)))
   .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
