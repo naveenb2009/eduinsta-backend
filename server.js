@@ -8,7 +8,14 @@
  *   2. Payment success must be verified by signature on a trusted server —
  *      otherwise anyone can edit localStorage and grant themselves Premium.
  *
- * This server is the trusted half. The app calls it; it talks to Razorpay.
+ * This server is the trusted half. It talks to TWO payment systems, split by
+ * purchase type (Play Store policy requires this split, not just a choice):
+ *   - Premium subscription (a consumer digital good, bought inside the app)
+ *     -> Google Play Billing via RevenueCat. This server never sees card/UPI
+ *     details for it; RevenueCat verifies the purchase against Google and
+ *     calls /api/revenuecat-webhook here once confirmed.
+ *   - Advertiser ad-campaign payments (a B2B service, not a digital good)
+ *     -> still Razorpay, via /api/create-order + /api/verify-payment.
  *
  * SETUP
  * -----
@@ -38,6 +45,7 @@ const {
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
+  REVENUECAT_WEBHOOK_AUTH,
   OWNER_TOKEN,
   PORT = 3000,
 } = process.env;
@@ -225,11 +233,16 @@ app.post('/api/create-order', async (req, res) => {
     const { type, userId, days } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
 
-    let amount, notes;
+    // Premium is a consumer digital good and, per Play Store policy, must go
+    // through Google Play Billing (see PurchasesService in the app + the
+    // /api/revenuecat-webhook route below), not this Razorpay order flow.
+    // This route now only creates orders for advertiser ad-campaign payments.
     if (type === 'premium') {
-      amount = PRICING.premiumMonthly;
-      notes = { type: 'premium', userId };
-    } else if (type === 'ad_campaign') {
+      return res.status(400).json({ error: 'Premium is purchased via Google Play Billing, not this endpoint' });
+    }
+
+    let amount, notes;
+    if (type === 'ad_campaign') {
       const d = Math.max(1, Math.min(30, Number(days) || 1));
       amount = PRICING.adPerDayPaise * d;
       notes = { type: 'ad_campaign', userId, days: String(d) };
@@ -275,18 +288,7 @@ app.post('/api/verify-payment', (req, res) => {
   }
 
   const now = Date.now();
-  if (type === 'premium') {
-    const expiresAt = now + PRICING.billingCycleDays * 86400000;
-    db.subscriptions.set(userId, {
-      status: 'active',
-      expiresAt,
-      paymentId: razorpay_payment_id,
-      amount: PRICING.premiumMonthly,
-    });
-    db.payments.push({ at: now, userId, type: 'premium', amountPaise: PRICING.premiumMonthly, paymentId: razorpay_payment_id });
-    return res.json({ ok: true, status: 'active', expiresAt });
-  }
-
+  // Premium no longer settles here -- see /api/revenuecat-webhook below.
   if (type === 'ad_campaign') {
     const d = Math.max(1, Math.min(30, Number(days) || 1));
     const amountPaise = PRICING.adPerDayPaise * d;
@@ -332,6 +334,55 @@ app.post('/api/razorpay-webhook', express.raw({ type: 'application/json' }), (re
   console.log('webhook event:', event.event);
   // Handle subscription.charged / payment.failed / refund.created here,
   // updating db.subscriptions accordingly.
+  res.json({ received: true });
+});
+
+/* ------------------------------------------------------------------
+   4b. REVENUECAT WEBHOOK — authoritative source for Premium.
+   Configure this URL (Project settings > Integrations > Webhooks) in the
+   RevenueCat dashboard, with the same secret string as REVENUECAT_WEBHOOK_AUTH
+   below set as the "Authorization header value". RevenueCat has already
+   verified the purchase against Google Play on its own infrastructure by the
+   time this fires -- our job here is just to trust RevenueCat (via the
+   shared secret) and mirror its verdict into db.subscriptions, the same
+   table /api/subscription/:userId reads from.
+   Event types: https://www.revenuecat.com/docs/integrations/webhooks/event-types
+   ------------------------------------------------------------------ */
+app.post('/api/revenuecat-webhook', express.json(), (req, res) => {
+  if (!REVENUECAT_WEBHOOK_AUTH) {
+    console.error('REVENUECAT_WEBHOOK_AUTH not set — rejecting webhook. See .env.example');
+    return res.status(500).json({ error: 'webhook not configured' });
+  }
+  const auth = req.headers['authorization'];
+  if (auth !== REVENUECAT_WEBHOOK_AUTH) {
+    return res.status(401).json({ error: 'invalid authorization' });
+  }
+
+  const event = req.body?.event;
+  if (!event) return res.status(400).json({ error: 'missing event' });
+
+  // app_user_id is whatever we passed as appUserID when calling
+  // Purchases.configure() client-side — currentUserId() in index.html.
+  const userId = event.app_user_id;
+  const now = Date.now();
+
+  const ACTIVE_TYPES = new Set(['INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION', 'PRODUCT_CHANGE']);
+  const INACTIVE_TYPES = new Set(['EXPIRATION', 'CANCELLATION']);
+
+  if (userId && ACTIVE_TYPES.has(event.type)) {
+    const expiresAt = event.expiration_at_ms ? Number(event.expiration_at_ms) : now + PRICING.billingCycleDays * 86400000;
+    db.subscriptions.set(userId, {
+      status: 'active',
+      expiresAt,
+      paymentId: event.transaction_id || event.id,
+      amount: PRICING.premiumMonthly,
+    });
+    db.payments.push({ at: now, userId, type: 'premium', amountPaise: PRICING.premiumMonthly, paymentId: event.transaction_id || event.id });
+  } else if (userId && INACTIVE_TYPES.has(event.type)) {
+    const existing = db.subscriptions.get(userId);
+    if (existing) existing.status = 'expired';
+  }
+
   res.json({ received: true });
 });
 
