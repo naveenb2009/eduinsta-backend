@@ -75,7 +75,7 @@ async function sendViaBrevo(to, code) {
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
-      'api-key': process.env.BREVO_API_KEY,
+      'api-key': (process.env.BREVO_API_KEY || '').trim(),
       'Content-Type': 'application/json',
       accept: 'application/json',
     },
@@ -86,14 +86,26 @@ async function sendViaBrevo(to, code) {
       htmlContent: otpEmailHtml(code),
     }),
   });
-  if (!res.ok) throw new Error(`Brevo ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    const body = await res.text();
+    if (res.status === 401) {
+      const key = (process.env.BREVO_API_KEY || '').trim();
+      const hint = key.startsWith('xsmtpsib-')
+        ? 'You are using an SMTP key. This API needs an API v3 key starting with "xkeysib-" (Brevo > SMTP & API > API Keys tab).'
+        : key.startsWith('xkeysib-')
+          ? 'Key format looks right but Brevo rejected it — it may have been revoked. Generate a new one.'
+          : `Key does not look like a Brevo API key (starts with "${key.slice(0, 9)}..."). Expected it to start with "xkeysib-".`;
+      throw new Error(`Brevo 401 unauthorized. ${hint}`);
+    }
+    throw new Error(`Brevo ${res.status}: ${body}`);
+  }
 }
 
 async function sendViaResend(to, code) {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      Authorization: `Bearer ${(process.env.RESEND_API_KEY || '').trim()}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -179,8 +191,31 @@ function checkRateLimit(target) {
   return { ok: true };
 }
 
+/* ---------------- Play Store reviewer bypass ----------------
+   Google Play's reviewer needs to sign in during app review, which can take
+   days — they have no real inbox to receive a live OTP. So one email address
+   (set via env vars) is whitelisted to always accept a FIXED code instead of
+   a real emailed one. Nothing is sent for this target; the code is simply
+   the one you put in the Play Console "App access" form.
+   Leave PLAY_REVIEWER_EMAIL unset to disable this entirely (default). */
+const REVIEWER_EMAIL = (process.env.PLAY_REVIEWER_EMAIL || '').trim().toLowerCase();
+const REVIEWER_CODE = process.env.PLAY_REVIEWER_CODE || '123456';
+function isReviewerTarget(target) {
+  return REVIEWER_EMAIL && String(target || '').trim().toLowerCase() === REVIEWER_EMAIL;
+}
+
 /* ---------------- Public API ---------------- */
 async function requestOtp(target, channel) {
+  if (isReviewerTarget(target)) {
+    otpStore.set(target, {
+      hash: hashCode(REVIEWER_CODE, target),
+      expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000, // effectively never expires
+      attempts: 0,
+      sentAt: 0, // no cooldown for the reviewer
+    });
+    return { ok: true, sent: true, expiresInSeconds: 365 * 24 * 60 * 60 };
+  }
+
   const limit = checkRateLimit(target);
   if (!limit.ok) return limit;
 
