@@ -243,6 +243,21 @@ app.get('/api/feed', async (req, res) => {
   }
 });
 
+/* Fetch specific reels by id, e.g. /api/reels/batch?ids=12,45,109. Used by
+   the profile page's Saved and Watch history tabs, which only have a list
+   of ids from local storage — those reels might not be on the first page
+   of the main feed (or on ANY page the user happened to scroll through). */
+app.get('/api/reels/batch', async (req, res) => {
+  try {
+    const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const rows = await reelsService.getReelsByIds(ids);
+    res.json({ ok: true, reels: rows.map(reelsService.toClientReel) });
+  } catch (err) {
+    console.error('batch reel fetch failed:', err);
+    res.status(500).json({ ok: false, reels: [] });
+  }
+});
+
 app.post('/api/reels/:id/like', async (req, res) => {
   try {
     const userId = req.body?.userId;
