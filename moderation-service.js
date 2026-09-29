@@ -88,13 +88,19 @@ Respond with ONLY a JSON object, no markdown fences, no commentary:
    generateContent. Result is cached for the process lifetime. */
 let cachedModel = null;
 const MODEL_PREFERENCE = [
-  'gemini-flash-latest',
   'gemini-2.5-flash',
-  'gemini-2.0-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-flash-latest',
   'gemini-flash-lite-latest',
+  'gemini-2.0-flash',
   'gemini-2.0-flash-001',
   'gemini-pro-latest',
 ];
+/* Tried in this order when the chosen model is overloaded (503/429) or missing
+   (404). Names that don't exist for a given key simply 404 and are skipped. */
+const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-flash-lite-latest'];
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function pickModel(key) {
   if (cachedModel) return cachedModel;
@@ -155,33 +161,43 @@ async function analyseVideo(buffer, mimeType) {
   }
   if (state !== 'ACTIVE') throw new Error(`Gemini file not ready (state: ${state})`);
 
-  // 3. Ask the model
-  const genRes = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: buildPrompt() },
-            { file_data: { mime_type: mimeType || 'video/mp4', file_uri: fileUri } },
-          ],
-        }],
-        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-      }),
+  // 3. Ask the model. Google's models return 503 "high demand" in bursts, so
+  //    retry with a short backoff, then fall back to the next model.
+  const candidates = [model, ...FALLBACK_MODELS.filter((m) => m !== model)];
+  let genRes = null;
+  let lastErr = '';
+  outer:
+  for (const m of candidates) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await sleep(1500 * attempt);
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${key}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: buildPrompt() },
+                { file_data: { mime_type: mimeType || 'video/mp4', file_uri: fileUri } },
+              ],
+            }],
+            generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+          }),
+        }
+      );
+      if (r.ok) {
+        genRes = r;
+        if (m !== model) console.log(`Moderation fell back to model ${m}`);
+        break outer;
+      }
+      const body = await r.text().catch(() => '');
+      lastErr = `Gemini analysis failed (${m}): ${r.status} ${body.slice(0, 200)}`;
+      if (r.status === 404) break;            // model not available -> next model
+      if (!RETRYABLE.has(r.status)) throw new Error(lastErr);
     }
-  );
-  if (!genRes.ok) {
-    const body = await genRes.text().catch(() => '');
-    if (genRes.status === 404) {
-      // The chosen model vanished or isn't valid for this key — clear the cache
-      // so the next attempt re-discovers, and report something actionable.
-      cachedModel = null;
-      throw new Error(`Gemini model "${model}" not available for this API key (404). ${body.slice(0, 200)}`);
-    }
-    throw new Error(`Gemini analysis failed: ${genRes.status} ${body.slice(0, 200)}`);
   }
+  if (!genRes) throw new Error(lastErr || 'Gemini analysis failed');
   const data = await genRes.json();
 
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
