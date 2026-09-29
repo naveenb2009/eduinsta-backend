@@ -31,43 +31,49 @@ const ALLOWED_CATEGORIES = [
 function buildPrompt() {
   return `You are the content reviewer for EduInsta, an educational short-video platform.
 
-Be GENEROUS. Your job is to let educational content through, not to gatekeep.
-If a video has ANY plausible learning, informational or skill-building value,
-APPROVE it. Only reject content that is clearly and entirely unrelated to
-learning.
+Decide whether this video belongs on an EDUCATION app. Be fair, not harsh:
+approve anything where a meaningful part of the video teaches, explains,
+informs or builds a skill. Reject only when the WHOLE video is clearly
+unrelated to learning, education or technology.
 
-APPROVE (this list is illustrative, not exhaustive):
-- any academic subject: science, maths, engineering, medicine, history,
-  geography, economics, civics, law, languages, literature
-- technology, programming, tools, software, hardware
-- exam preparation, study tips, problem solving, revision, career guidance
-- practical skills, tutorials, demonstrations, experiments, "how things work"
-- explainers, documentaries, news analysis, factual commentary
-- crafts, cooking technique, fitness technique, music theory, art technique
-- educational content aimed at children, including simple or playful formats
-- informal or entertaining teaching styles — humour does not disqualify it
-- videos that are partly personal or casual but still teach something
-- content where you are unsure: DEFAULT TO APPROVING
+APPROVE (illustrative, not exhaustive):
+- any academic or school/college subject: science, maths, engineering, medicine,
+  history, geography, economics, civics, law, languages, literature, commerce
+- technology, programming, software, hardware, electronics, AI
+- exam preparation (school boards, JEE, NEET, UPSC, SSC, banking, GATE, CAT...),
+  study tips, revision, career guidance, interview preparation
+- practical skills, tutorials, demonstrations, experiments, "how things work",
+  cooking/fitness/music/art technique taught step by step
+- explainers, documentaries, factual news analysis, general knowledge
+- educational content for children, including playful formats
+- a teaching video with humour or an informal style is still educational
+- a teacher, coach or institute sharing lessons, tips or exam advice
+- if it is genuinely borderline, lean towards APPROVING
 
-REJECT only if the video has no educational or informational value at all,
-for example: pure dance/lip-sync, random pets or scenery with no commentary,
-pure product advertising, or content that is simply unrelated to learning.
+REJECT when the whole video is one of these, with no real teaching in it:
+- comedy skits, pranks, memes, roasts, challenges and trends
+- dance, lip-sync, singing or music videos with no lesson
+- movie/TV/web-series clips, celebrity gossip, fashion or beauty with no how-to
+- gaming or vlogs with no teaching, random pets/scenery/daily-life footage
+- pure advertisements or product/brand promotion (advertisers use the separate
+  "Advertise on EduInsta" flow, so set content_type to "advertisement")
+- sexual, suggestive or adult content of any kind (set safety_flags)
 
 SEPARATELY, set safety_flags (and only then) if the video contains:
-- sexual content, or any sexualisation of minors
+- sexual, nude, suggestive or adult content, or any sexualisation of minors
 - graphic violence or gore
 - self-harm or suicide content
 - instructions for weapons, explosives, or drug manufacture
 - hate speech targeting a protected group
-These are the only hard limits. Everything else should pass.
 
 Respond with ONLY a JSON object, no markdown fences, no commentary:
 {
   "approved": true or false,
+  "content_type": "educational" | "entertainment" | "advertisement" | "adult" | "other",
   "category": one of ${JSON.stringify(ALLOWED_CATEGORIES)} or "not_educational",
   "subject": "short specific topic",
-  "confidence": 0.0 to 1.0,
-  "reason": "one clear sentence the uploader will read",
+  "confidence": 0.0 to 1.0 (how sure you are of the approved/rejected decision),
+  "reason": "one clear, polite sentence the uploader will read, saying what the video is and why it does not fit (or fits)",
   "safety_flags": ["only for the serious categories above; empty otherwise"],
   "suggested_title": "a concise accurate title, or null"
 }`;
@@ -204,7 +210,7 @@ async function analyseVideo(buffer, mimeType) {
    minors, self-harm instructions and weapon/drug manufacture are hard rejects
    regardless of how educational the framing is. That isn't strictness, it's the
    baseline every platform needs to stay operable and lawful. */
-const MIN_CONFIDENCE = Number(process.env.MODERATION_MIN_CONFIDENCE || 0.25);
+const MIN_CONFIDENCE = Number(process.env.MODERATION_MIN_CONFIDENCE || 0.5);
 
 /* Only these flags block an upload. Anything else the model reports is noted
    but does not stop publication. */
@@ -213,6 +219,7 @@ const HARD_BLOCK = [
   'self-harm', 'selfharm', 'suicide',
   'weapon', 'explosive', 'bomb', 'firearm', 'drug manufacture',
   'gore', 'graphic violence', 'hate speech',
+  'suggestive', 'adult', 'explicit',
 ];
 
 function isHardBlock(flags) {
@@ -246,6 +253,7 @@ async function moderateVideo(buffer, mimeType) {
       status: 'rejected',
       approved: false,
       category: verdict.category,
+      content_type: verdict.content_type || 'adult',
       reason: verdict.reason || 'This video does not meet our content safety guidelines.',
       safety_flags: flags,
     };
@@ -270,6 +278,7 @@ async function moderateVideo(buffer, mimeType) {
     status: 'rejected',
     approved: false,
     category: verdict.category || 'not_educational',
+    content_type: verdict.content_type || 'other',
     confidence,
     reason: verdict.reason || 'This video does not appear to be educational content.',
   };
