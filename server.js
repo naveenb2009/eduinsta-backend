@@ -89,6 +89,34 @@ const PRICING = {
    The code is generated, hashed and verified here. It is never sent
    back to the browser, so it can't be read out of the page.
    ------------------------------------------------------------------ */
+/* Lets the signup form say "this email already has an account" BEFORE a
+   verification code is sent, instead of only after the user has typed it.
+   Rate-limited per IP (20 checks / 10 min) so it can't be used to test long
+   lists of addresses for existing accounts. */
+const emailCheckHits = new Map();
+app.post('/api/check-email', async (req, res) => {
+  const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+  const now = Date.now();
+  const recent = (emailCheckHits.get(ip) || []).filter((t) => now - t < 10 * 60 * 1000);
+  if (recent.length >= 20) {
+    return res.status(429).json({ ok: false, error: 'Too many attempts. Please wait a few minutes and try again.' });
+  }
+  recent.push(now);
+  emailCheckHits.set(ip, recent);
+  if (emailCheckHits.size > 5000) emailCheckHits.clear();   // keep memory bounded
+
+  const email = String((req.body || {}).email || '').trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: 'Enter a valid email address' });
+  }
+  try {
+    res.json({ ok: true, exists: await authService.userExists(email) });
+  } catch (err) {
+    console.error('check-email failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not check the email right now' });
+  }
+});
+
 app.post('/api/send-otp', async (req, res) => {
   const { target, channel } = req.body || {};
   if (!target) return res.status(400).json({ ok: false, error: 'target required' });
