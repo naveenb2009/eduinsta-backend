@@ -35,6 +35,8 @@ const cors = require('cors');
 const Razorpay = require('razorpay');
 const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
+const subscriptionsService = require('./subscriptions-service');
+const session = require('./session-service');
 const reelsService = require('./reels-service');
 const diagnosticsService = require('./diagnostics-service');
 const authService = require('./auth-service');
@@ -133,7 +135,8 @@ app.post('/api/verify-otp', (req, res) => {
   const { target, code } = req.body || {};
   if (!target || !code) return res.status(400).json({ ok: false, error: 'target and code required' });
   const result = verifyOtp(target, code);
-  res.status(result.ok ? 200 : 400).json(result);
+  if (result.ok) return res.json({ ...result, ticket: session.issueTicket(target) });
+  res.status(400).json(result);
 });
 
 
@@ -155,7 +158,7 @@ app.post('/api/signup', async (req, res) => {
       return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
     }
     await authService.createUser({ email, name, phone, password });
-    res.json({ ok: true });
+    res.json({ ok: true, token: session.issueToken(email) });
   } catch (err) {
     console.error('signup failed:', err);
     res.status(500).json({ ok: false, error: 'Could not create your account. Please try again.' });
@@ -167,7 +170,7 @@ app.post('/api/login', async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password are required' });
     const result = await authService.verifyPassword(email, password);
-    if (result.ok) return res.json(result);
+    if (result.ok) return res.json({ ...result, token: session.issueToken(email) });
     res.status(result.notFound ? 404 : 401).json(result);
   } catch (err) {
     console.error('login failed:', err);
@@ -177,8 +180,12 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/reset-password', async (req, res) => {
   try {
-    const { email, newPassword } = req.body || {};
+    const { email, newPassword, ticket } = req.body || {};
     if (!email || !newPassword) return res.status(400).json({ ok: false, error: 'email and newPassword are required' });
+    /* Only after a correct emailed code for THIS email (see session-service). */
+    if (!session.consumeTicket(ticket, email)) {
+      return res.status(403).json({ ok: false, error: 'Your verification expired. Please request a new code and try again.' });
+    }
     const result = await authService.updatePassword(email, newPassword);
     res.status(result.ok ? 200 : 404).json(result);
   } catch (err) {
@@ -194,6 +201,30 @@ app.post('/api/reset-password', async (req, res) => {
    instead of Firebase Crashlytics). Accepts one event per call, silently
    rate-limited per user so a runaway client-side error loop can't spam it.
    ------------------------------------------------------------------ */
+/* Content reports ("Report this reel"). Google Play requires apps with
+   user-uploaded content to let users flag objectionable content AND for the
+   developer to actually receive those flags. Stored alongside diagnostics so
+   they persist in Postgres and show up on the same protected viewer:
+     /diagnostics?key=YOUR_DIAGNOSTICS_ACCESS_KEY&type=report  */
+app.post('/api/reports', async (req, res) => {
+  try {
+    const { reelId, reason, details, userId } = req.body || {};
+    if (!reelId || !reason) return res.status(400).json({ ok: false, error: 'reelId and reason are required' });
+    const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const result = await diagnosticsService.logEvent({
+      type: 'report',
+      message: `Reel #${reelId}: ${String(reason).slice(0, 120)}`,
+      context: { reelId, reason, details: String(details || '').slice(0, 1000), reelLink: `${base}/reel/${encodeURIComponent(reelId)}` },
+      userId: userId || null,
+      platform: 'app',
+    });
+    res.status(result.ok ? 200 : 429).json(result.ok ? { ok: true } : { ok: false, error: 'Too many reports. Please try again later.' });
+  } catch (err) {
+    console.error('report failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not submit the report' });
+  }
+});
+
 app.post('/api/diagnostics', async (req, res) => {
   try {
     const { type, message, stack, context, userId, appVersion, platform } = req.body || {};
@@ -261,6 +292,7 @@ function escapeHtmlSrv(s) {
    ------------------------------------------------------------------ */
 app.post('/api/education-check', upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ status: 'error', reason: 'No video supplied' });
+  if (!/^video\//.test(req.file.mimetype || '')) return res.status(400).json({ status: 'error', reason: 'Please choose a video file.' });
   const result = await moderateVideo(req.file.buffer, req.file.mimetype);
   if (result.status === 'manual_review' || result.status === 'rejected') {
     db.moderationQueue = db.moderationQueue || [];
@@ -285,6 +317,7 @@ app.post('/api/education-check', upload.single('video'), async (req, res) => {
 app.post('/api/reels', upload.single('video'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No video supplied' });
+    if (!/^video\//.test(req.file.mimetype || '')) return res.status(400).json({ error: 'Only video files can be uploaded' });
     const { title, description, category, subject, creator } = req.body;
     if (!title || !creator) return res.status(400).json({ error: 'title and creator are required' });
 
@@ -343,7 +376,8 @@ app.post('/api/reels/:id/like', async (req, res) => {
     const userId = req.body?.userId;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     res.json(await reelsService.toggleLike(req.params.id, userId));
-  } catch {
+  } catch (err) {
+    if (/not found/i.test(err && err.message)) return res.status(404).json({ error: 'Reel not found' });
     res.status(500).json({ error: 'Could not update the like' });
   }
 });
@@ -353,7 +387,10 @@ app.post('/api/reels/:id/view', async (req, res) => {
   catch { res.json({ ok: false }); }
 });
 
-app.delete('/api/reels/:id', async (req, res) => {
+/* Owner-only (Authorization: Bearer OWNER_TOKEN) — e.g. removing a reported
+   reel. It used to accept the creator's public @handle as proof, which let
+   anyone delete anyone's reel. Send {"creator":"@handle"} in the body. */
+app.delete('/api/reels/:id', requireOwner, async (req, res) => {
   try {
     const ok = await reelsService.deleteReel(req.params.id, req.body?.creator);
     res.status(ok ? 200 : 404).json({ ok });
@@ -369,7 +406,7 @@ app.delete('/api/reels/:id', async (req, res) => {
 app.post('/api/reels/:id/comments', async (req, res) => {
   try {
     const { userId, username, text } = req.body || {};
-    if (!userId || !text) return res.status(400).json({ ok: false, error: 'userId and text are required' });
+    if (!userId || !String(text || '').trim()) return res.status(400).json({ ok: false, error: 'Write something before posting.' });
     const row = await reelsService.addComment(req.params.id, userId, username, text);
     res.json({ ok: true, comment: reelsService.toClientComment(row) });
   } catch (err) {
@@ -398,6 +435,7 @@ app.post('/api/profile/avatar', upload.single('avatar'), async (req, res) => {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No image supplied' });
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
+    if (!session.isSignedInAs(req, userId)) return res.status(401).json({ ok: false, error: 'Please log in again to change your photo.' });
     if (!req.file.mimetype.startsWith('image/')) {
       return res.status(400).json({ ok: false, error: 'File must be an image' });
     }
@@ -411,6 +449,7 @@ app.post('/api/profile/avatar', upload.single('avatar'), async (req, res) => {
 
 app.delete('/api/profile/avatar/:userId', async (req, res) => {
   try {
+    if (!session.isSignedInAs(req, req.params.userId)) return res.status(401).json({ ok: false, error: 'Please log in again to change your photo.' });
     await reelsService.deleteAvatar(req.params.userId);
     res.json({ ok: true });
   } catch (err) {
@@ -538,14 +577,18 @@ app.post('/api/verify-payment', (req, res) => {
    3. SUBSCRIPTION STATUS — the app asks the server, not localStorage.
    This is what makes Premium un-fakeable from the client.
    ------------------------------------------------------------------ */
-app.get('/api/subscription/:userId', (req, res) => {
-  const sub = db.subscriptions.get(req.params.userId);
-  if (!sub) return res.json({ status: 'free' });
-  if (Date.now() > sub.expiresAt) {
-    sub.status = 'expired';
-    return res.json({ status: 'expired', expiresAt: sub.expiresAt });
+app.get('/api/subscription/:userId', async (req, res) => {
+  try {
+    const sub = await subscriptionsService.get(req.params.userId);
+    if (!sub) return res.json({ status: 'free' });
+    if (sub.expiresAt && Date.now() > sub.expiresAt) {
+      return res.json({ status: 'expired', expiresAt: sub.expiresAt });
+    }
+    res.json({ status: sub.status, expiresAt: sub.expiresAt });
+  } catch (err) {
+    console.error('subscription lookup failed:', err);
+    res.status(500).json({ error: 'Could not check the subscription' });
   }
-  res.json({ status: sub.status, expiresAt: sub.expiresAt });
 });
 
 /* ------------------------------------------------------------------
@@ -570,7 +613,7 @@ app.get('/api/subscription/:userId', (req, res) => {
        send-otp/verify-otp flow used for sign-in) before deleting anything.
    ------------------------------------------------------------------ */
 async function performAccountDeletion(userId) {
-  db.subscriptions.delete(userId);
+  await subscriptionsService.remove(userId).catch((e) => console.error('subscription delete failed:', e.message));
   db.payments.forEach((p) => {
     if (p.userId === userId) p.userId = '[deleted-user]';
   });
@@ -606,6 +649,9 @@ async function performAccountDeletion(userId) {
 app.delete('/api/account/:userId', async (req, res) => {
   const { userId } = req.params;
   if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
+  if (!session.isSignedInAs(req, userId)) {
+    return res.status(401).json({ ok: false, error: 'For your security, please log out and log in again, then delete your account.' });
+  }
   const reelsDeleted = await performAccountDeletion(userId);
   console.log(`Account deleted (in-app): ${userId} (${reelsDeleted} reel(s) removed)`);
   res.json({ ok: true, reelsDeleted });
@@ -654,7 +700,7 @@ app.post('/api/razorpay-webhook', express.raw({ type: 'application/json' }), (re
    table /api/subscription/:userId reads from.
    Event types: https://www.revenuecat.com/docs/integrations/webhooks/event-types
    ------------------------------------------------------------------ */
-app.post('/api/revenuecat-webhook', express.json(), (req, res) => {
+app.post('/api/revenuecat-webhook', express.json(), async (req, res) => {
   if (!REVENUECAT_WEBHOOK_AUTH) {
     console.error('REVENUECAT_WEBHOOK_AUTH not set — rejecting webhook. See .env.example');
     return res.status(500).json({ error: 'webhook not configured' });
@@ -673,20 +719,30 @@ app.post('/api/revenuecat-webhook', express.json(), (req, res) => {
   const now = Date.now();
 
   const ACTIVE_TYPES = new Set(['INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION', 'PRODUCT_CHANGE']);
-  const INACTIVE_TYPES = new Set(['EXPIRATION', 'CANCELLATION']);
+  /* CANCELLATION only means auto-renew was switched off: the user has paid
+     up to expiration_at_ms and keeps Premium until then. Only EXPIRATION
+     actually ends it (the expiry date check in /api/subscription does too). */
+  const ENDED_TYPES = new Set(['EXPIRATION']);
 
-  if (userId && ACTIVE_TYPES.has(event.type)) {
-    const expiresAt = event.expiration_at_ms ? Number(event.expiration_at_ms) : now + PRICING.billingCycleDays * 86400000;
-    db.subscriptions.set(userId, {
-      status: 'active',
-      expiresAt,
-      paymentId: event.transaction_id || event.id,
-      amount: PRICING.premiumMonthly,
-    });
-    db.payments.push({ at: now, userId, type: 'premium', amountPaise: PRICING.premiumMonthly, paymentId: event.transaction_id || event.id });
-  } else if (userId && INACTIVE_TYPES.has(event.type)) {
-    const existing = db.subscriptions.get(userId);
-    if (existing) existing.status = 'expired';
+  try {
+    if (userId && ACTIVE_TYPES.has(event.type)) {
+      const expiresAt = event.expiration_at_ms ? Number(event.expiration_at_ms) : now + PRICING.billingCycleDays * 86400000;
+      await subscriptionsService.set(userId, {
+        status: 'active',
+        expiresAt,
+        paymentId: event.transaction_id || event.id,
+        amount: PRICING.premiumMonthly,
+      });
+      db.payments.push({ at: now, userId, type: 'premium', amountPaise: PRICING.premiumMonthly, paymentId: event.transaction_id || event.id });
+    } else if (userId && event.type === 'CANCELLATION' && event.expiration_at_ms) {
+      const existing = await subscriptionsService.get(userId);
+      if (existing) await subscriptionsService.set(userId, { ...existing, expiresAt: Number(event.expiration_at_ms) });
+    } else if (userId && ENDED_TYPES.has(event.type)) {
+      await subscriptionsService.setStatus(userId, 'expired');
+    }
+  } catch (err) {
+    console.error('revenuecat webhook store failed:', err);
+    return res.status(500).json({ error: 'store failed' });   // RevenueCat retries on non-2xx
   }
 
   res.json({ received: true });
@@ -864,6 +920,6 @@ app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_H
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema()])
+Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema()])
   .then(() => app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`)))
   .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
