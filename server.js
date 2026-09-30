@@ -293,6 +293,9 @@ function escapeHtmlSrv(s) {
 app.post('/api/education-check', upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ status: 'error', reason: 'No video supplied' });
   if (!/^video\//.test(req.file.mimetype || '')) return res.status(400).json({ status: 'error', reason: 'Please choose a video file.' });
+  if (!session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''))) {
+    return res.status(401).json({ status: 'error', reason: 'Please log out and log in again, then try uploading.' });
+  }
   const result = await moderateVideo(req.file.buffer, req.file.mimetype);
   if (result.status === 'manual_review' || result.status === 'rejected') {
     db.moderationQueue = db.moderationQueue || [];
@@ -318,6 +321,8 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No video supplied' });
     if (!/^video\//.test(req.file.mimetype || '')) return res.status(400).json({ error: 'Only video files can be uploaded' });
+    const ownerId = session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
+    if (!ownerId) return res.status(401).json({ error: 'Please log out and log in again, then upload your reel.' });
     const { title, description, category, subject, creator } = req.body;
     if (!title || !creator) return res.status(400).json({ error: 'title and creator are required' });
 
@@ -332,7 +337,7 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
       description: description || '',
       category: category || verdict.category || '',
       subject: subject || verdict.subject || '',
-      videoKey: key, videoUrl: url,
+      videoKey: key, videoUrl: url, ownerId,
     });
     res.json({ ok: true, reel: reelsService.toClientReel(row), verdict });
   } catch (err) {
@@ -385,6 +390,33 @@ app.post('/api/reels/:id/like', async (req, res) => {
 app.post('/api/reels/:id/view', async (req, res) => {
   try { await reelsService.incrementViews(req.params.id); res.json({ ok: true }); }
   catch { res.json({ ok: false }); }
+});
+
+/* The signed-in creator's own reels (Profile > Uploads) and deleting one of
+   them. Ownership = the account that uploaded it (session token), not the
+   editable public @handle. */
+app.get('/api/my/reels', async (req, res) => {
+  const me = session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  try {
+    const rows = await reelsService.listOwnReels(me, String(req.query.creator || ''));
+    res.json({ ok: true, reels: rows.map(reelsService.toClientReel) });
+  } catch (err) {
+    console.error('my reels failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load your reels' });
+  }
+});
+app.delete('/api/my/reels/:id', async (req, res) => {
+  const me = session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log out and log in again, then delete the reel.' });
+  try {
+    const ok = await reelsService.deleteOwnReel(req.params.id, me);
+    if (!ok) return res.status(404).json({ ok: false, error: 'This reel could not be deleted from your account. Reels uploaded before this update can be removed by contacting support.' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('delete own reel failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not delete the reel' });
+  }
 });
 
 /* Owner-only (Authorization: Bearer OWNER_TOKEN) — e.g. removing a reported
@@ -636,7 +668,9 @@ async function performAccountDeletion(userId) {
     console.error('account deletion: failed to delete comments for', userId, err);
   }
   try {
-    return await reelsService.deleteAllReelsByCreator(userId);
+    // By owner account (the old lookup by creator matched nothing, because
+    // reels are stored under the @handle, not the email).
+    return await reelsService.deleteAllReelsByOwner(userId);
   } catch (err) {
     console.error('account deletion: failed to delete reels for', userId, err);
     // Continue rather than fail the whole request — subscription/payment
