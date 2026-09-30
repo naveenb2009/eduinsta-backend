@@ -24,7 +24,7 @@ const MAX_MEMORY_EVENTS = 500;   // ring buffer size when there's no database
 const MAX_MESSAGE_LEN = 500;
 const MAX_STACK_LEN = 4000;
 const MAX_CONTEXT_LEN = 2000;
-const VALID_TYPES = new Set(['crash', 'error', 'performance']);
+const VALID_TYPES = new Set(['crash', 'error', 'performance', 'report']);
 
 const HAS_DB = !!process.env.DATABASE_URL;
 let pool = null;
@@ -88,6 +88,7 @@ async function logEvent({ type, message, stack, context, userId, appVersion, pla
   // Also goes to Render's own logs -- the fastest way to notice a crash
   // spike without opening anything extra.
   if (type === 'crash') console.error(`[diagnostics] CRASH ${row.user_id || ''}: ${row.message}`);
+  if (type === 'report') console.warn(`[report] ${row.user_id || 'anonymous'}: ${row.message}`);
 
   if (!HAS_DB) {
     memoryEvents.push({ id: ++__idSeq, ...row, created_at: new Date().toISOString() });
