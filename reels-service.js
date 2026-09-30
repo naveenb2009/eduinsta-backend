@@ -174,6 +174,12 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS reels_created_idx ON reels (created_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS reels_creator_idx ON reels (creator);
+    -- Account (email) that uploaded the reel. The public @creator handle can
+    -- be changed or copied, so ownership (delete, account deletion, "my
+    -- uploads") is decided by this column instead. NULL for reels uploaded
+    -- before it existed.
+    ALTER TABLE reels ADD COLUMN IF NOT EXISTS owner_id TEXT;
+    CREATE INDEX IF NOT EXISTS reels_owner_idx ON reels (owner_id);
 
     CREATE TABLE IF NOT EXISTS reel_likes (
       reel_id  BIGINT NOT NULL,
@@ -202,10 +208,11 @@ async function initSchema() {
   if (!HAS_R2) console.warn('⚠️  No R2 configured — videos are held in memory and lost on restart.');
 }
 
-async function createReel({ creator, title, description, category, subject, videoKey, videoUrl }) {
+async function createReel({ creator, title, description, category, subject, videoKey, videoUrl, ownerId = null }) {
+  ownerId = ownerId ? String(ownerId).trim().toLowerCase() : null;
   if (!HAS_DB) {
     const row = {
-      id: nextMemoryId(), creator, title, description, category, subject,
+      id: nextMemoryId(), creator, title, description, category, subject, owner_id: ownerId,
       video_key: videoKey, video_url: videoUrl, status: 'published',
       likes: 0, views: 0, created_at: new Date().toISOString(),
     };
@@ -213,9 +220,9 @@ async function createReel({ creator, title, description, category, subject, vide
     return row;
   }
   const { rows } = await getPool().query(
-    `INSERT INTO reels (creator,title,description,category,subject,video_key,video_url)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [creator, title, description || '', category || '', subject || '', videoKey, videoUrl]
+    `INSERT INTO reels (creator,title,description,category,subject,video_key,video_url,owner_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [creator, title, description || '', category || '', subject || '', videoKey, videoUrl, ownerId]
   );
   return rows[0];
 }
@@ -530,7 +537,63 @@ function toClientReel(row) {
   };
 }
 
+/* ---- Ownership-based operations (owner_id = uploader's account email) ---- */
+async function removeReelRow(row) {
+  await deleteVideo(row.video_key).catch(() => {});
+  await deleteCommentsForReel(row.id).catch(() => {});
+  if (HAS_DB) await getPool().query('DELETE FROM reel_likes WHERE reel_id=$1', [row.id]).catch(() => {});
+}
+
+/* A creator deleting one of their own reels. Returns true only when the reel
+   exists AND belongs to ownerId. */
+async function deleteOwnReel(reelId, ownerId) {
+  const owner = String(ownerId || '').trim().toLowerCase();
+  if (!owner) return false;
+  if (!HAS_DB) {
+    const i = memoryReels.findIndex((x) => String(x.id) === String(reelId) && x.owner_id === owner);
+    if (i < 0) return false;
+    const [row] = memoryReels.splice(i, 1);
+    await removeReelRow(row);
+    return true;
+  }
+  const { rows } = await getPool().query(
+    'DELETE FROM reels WHERE id=$1 AND owner_id=$2 RETURNING id, video_key', [reelId, owner]
+  );
+  if (!rows.length) return false;
+  await removeReelRow(rows[0]);
+  return true;
+}
+
+/* Every reel owned by this account (used by account deletion). */
+async function deleteAllReelsByOwner(ownerId) {
+  const owner = String(ownerId || '').trim().toLowerCase();
+  if (!owner) return 0;
+  if (!HAS_DB) {
+    const mine = memoryReels.filter((x) => x.owner_id === owner);
+    for (const r of mine) { memoryReels.splice(memoryReels.indexOf(r), 1); await removeReelRow(r); }
+    return mine.length;
+  }
+  const { rows } = await getPool().query('DELETE FROM reels WHERE owner_id=$1 RETURNING id, video_key', [owner]);
+  for (const row of rows) await removeReelRow(row);
+  return rows.length;
+}
+
+/* "My uploads": reels owned by this account, plus older reels (no owner yet)
+   posted under the given @handle. */
+async function listOwnReels(ownerId, handle) {
+  const owner = String(ownerId || '').trim().toLowerCase();
+  if (!HAS_DB) {
+    return memoryReels.filter((r) => (owner && r.owner_id === owner) || (!r.owner_id && handle && r.creator === handle)).slice(0, 100);
+  }
+  const { rows } = await getPool().query(
+    `SELECT * FROM reels WHERE status='published' AND (owner_id=$1 OR (owner_id IS NULL AND creator=$2))
+     ORDER BY id DESC LIMIT 100`, [owner, handle || '']
+  );
+  return rows;
+}
+
 module.exports = {
+  deleteOwnReel, deleteAllReelsByOwner, listOwnReels,
   initSchema, storeVideo, readVideo, createReel, listReels, getReel, getReelsByIds,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   storeImage, setAvatar, getAvatars, deleteAvatar,
