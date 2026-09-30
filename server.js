@@ -37,6 +37,7 @@ const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
 const subscriptionsService = require('./subscriptions-service');
 const session = require('./session-service');
+const campaignsService = require('./campaigns-service');
 const reelsService = require('./reels-service');
 const diagnosticsService = require('./diagnostics-service');
 const authService = require('./auth-service');
@@ -418,6 +419,63 @@ app.delete('/api/my/reels/:id', async (req, res) => {
     res.status(500).json({ ok: false, error: 'Could not delete the reel' });
   }
 });
+
+/* ------------------------------------------------------------------
+   DIRECT AD CAMPAIGNS (Sponsored reels sold by the owner, paid outside the
+   app). Public: the running list + view/click counting. Owner-only
+   (Bearer OWNER_TOKEN): create / list with stats / end / delete.
+   ------------------------------------------------------------------ */
+app.get('/api/campaigns/active', async (_req, res) => {
+  try { res.json({ ok: true, campaigns: await campaignsService.listActive() }); }
+  catch (err) { console.error('campaigns list failed:', err); res.json({ ok: false, campaigns: [] }); }
+});
+/* One view per device per campaign per 30 min, one click per 2 min, so
+   re-renders or a script can't inflate the numbers shown to advertisers. */
+const adHits = new Map();
+function countOnce(key, windowMs) {
+  const now = Date.now();
+  if (adHits.size > 20000) for (const [k, t] of adHits) if (now - t > 3600000) adHits.delete(k);
+  const last = adHits.get(key);
+  if (last && now - last < windowMs) return false;
+  adHits.set(key, now);
+  return true;
+}
+function clientKey(req) { return String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim(); }
+app.post('/api/campaigns/:id/impression', async (req, res) => {
+  try {
+    const who = (req.body && req.body.deviceId) || clientKey(req);
+    if (countOnce(`i:${req.params.id}:${who}`, 30 * 60000)) await campaignsService.bump(req.params.id, 'impressions');
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+app.post('/api/campaigns/:id/click', async (req, res) => {
+  try {
+    const who = (req.body && req.body.deviceId) || clientKey(req);
+    if (countOnce(`c:${req.params.id}:${who}`, 2 * 60000)) await campaignsService.bump(req.params.id, 'clicks');
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+app.get('/api/owner/campaigns', requireOwner, async (_req, res) => {
+  try { res.json({ ok: true, campaigns: await campaignsService.listAll() }); }
+  catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Could not load campaigns' }); }
+});
+app.post('/api/owner/campaigns', requireOwner, async (req, res) => {
+  try {
+    const r = await campaignsService.create(req.body || {});
+    if (r.error) return res.status(400).json({ ok: false, error: r.error });
+    res.json({ ok: true, campaign: r.campaign });
+  } catch (err) { console.error(err); res.status(500).json({ ok: false, error: 'Could not create the campaign' }); }
+});
+app.post('/api/owner/campaigns/:id/end', requireOwner, async (req, res) => {
+  try { const ok = await campaignsService.end(req.params.id); res.status(ok ? 200 : 404).json({ ok }); }
+  catch (err) { console.error(err); res.status(500).json({ ok: false }); }
+});
+app.delete('/api/owner/campaigns/:id', requireOwner, async (req, res) => {
+  try { const ok = await campaignsService.remove(req.params.id); res.status(ok ? 200 : 404).json({ ok }); }
+  catch (err) { console.error(err); res.status(500).json({ ok: false }); }
+});
+/* Lets the app's owner screen check a pasted owner key before saving it. */
+app.get('/api/owner/verify', requireOwner, (_req, res) => res.json({ ok: true }));
 
 /* Owner-only (Authorization: Bearer OWNER_TOKEN) — e.g. removing a reported
    reel. It used to accept the creator's public @handle as proof, which let
@@ -954,6 +1012,6 @@ app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_H
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema()])
+Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema()])
   .then(() => app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`)))
   .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
