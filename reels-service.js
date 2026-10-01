@@ -229,15 +229,49 @@ async function createReel({ creator, title, description, category, subject, vide
 
 /* Keyset pagination, not OFFSET. With OFFSET the database still scans every
    skipped row, so page 500 gets slow; a cursor stays fast at any depth. */
-async function listReels({ limit = 10, cursor = null, creator = null } = {}) {
+/* Every reel stays listed until its uploader (or the owner) deletes it:
+   there is no total cap. `limit` is only the size of ONE page - the app
+   keeps asking for the next page (cursor) as the user scrolls, so a
+   catalogue of any size is reachable, newest first.
+
+   Optional filters (all combinable):
+     creator   - one @handle
+     creators  - several @handles (Following tab)
+     topics    - categories/subjects (Explore chips)
+     q         - search text; a reel matches if ANY word appears in its
+                 title, description, category, subject or creator
+     any       - comma-separated phrases (For You interests); a reel matches
+                 if ANY phrase appears in those same fields */
+const toList = (v, max) => (Array.isArray(v) ? v : String(v || '').split(','))
+  .map((s) => String(s).trim()).filter(Boolean).slice(0, max);
+const searchTerms = (q) => String(q || '').toLowerCase().split(/\s+/).map((t) => t.trim()).filter(Boolean).slice(0, 8);
+const likeEscape = (s) => s.replace(/[\\%_]/g, (c) => '\\' + c);
+
+async function listReels({ limit = 10, cursor = null, creator = null, creators = null, topics = null, q = null, any = null } = {}) {
   const lim = Math.min(50, Math.max(1, Number(limit) || 10));
+  const creatorList = creators ? toList(creators, 500) : [];
+  const topicList = topics ? toList(topics, 200) : [];
+  const terms = searchTerms(q);
+  const phrases = any ? toList(any, 150).map((t) => t.toLowerCase()) : [];
+  if (creators && !creatorList.length) return { items: [], nextCursor: null };
 
   if (!HAS_DB) {
-    let items = memoryReels.filter((r) => !creator || r.creator === creator);
-    if (cursor) {
-      const i = items.findIndex((r) => String(r.id) === String(cursor));
-      items = i >= 0 ? items.slice(i + 1) : items;
-    }
+    const topicSet = new Set(topicList.map((t) => t.toLowerCase()));
+    let items = memoryReels.filter((r) => {
+      if (creator && r.creator !== creator) return false;
+      if (creatorList.length && !creatorList.includes(r.creator)) return false;
+      if (topicSet.size && !topicSet.has(String(r.category || '').toLowerCase()) && !topicSet.has(String(r.subject || '').toLowerCase())) return false;
+      if (terms.length) {
+        const hay = [r.title, r.description, r.category, r.subject, r.creator].join(' ').toLowerCase();
+        if (!terms.some((t) => hay.includes(t))) return false;
+      }
+      if (phrases.length) {
+        const hay = [r.title, r.description, r.category, r.subject, r.creator].join(' ').toLowerCase();
+        if (!phrases.some((t) => hay.includes(t))) return false;
+      }
+      return true;
+    });
+    if (cursor) items = items.filter((r) => Number(r.id) < Number(cursor));
     const page = items.slice(0, lim);
     return { items: page, nextCursor: page.length === lim ? String(page[page.length - 1].id) : null };
   }
@@ -245,6 +279,24 @@ async function listReels({ limit = 10, cursor = null, creator = null } = {}) {
   const params = [];
   let where = `WHERE status = 'published'`;
   if (creator) { params.push(creator); where += ` AND creator = $${params.length}`; }
+  if (creatorList.length) { params.push(creatorList); where += ` AND creator = ANY($${params.length}::text[])`; }
+  if (topicList.length) {
+    params.push(topicList.map((t) => t.toLowerCase()));
+    where += ` AND (lower(category) = ANY($${params.length}::text[]) OR lower(subject) = ANY($${params.length}::text[]))`;
+  }
+  if (terms.length) {
+    const ors = terms.map((t) => {
+      params.push('%' + likeEscape(t) + '%');
+      const p = `$${params.length}`;
+      return `(title ILIKE ${p} OR description ILIKE ${p} OR category ILIKE ${p} OR subject ILIKE ${p} OR creator ILIKE ${p})`;
+    });
+    where += ` AND (${ors.join(' OR ')})`;
+  }
+  if (phrases.length) {
+    params.push(phrases.map((t) => '%' + likeEscape(t) + '%'));
+    const p = `$${params.length}::text[]`;
+    where += ` AND (title ILIKE ANY(${p}) OR description ILIKE ANY(${p}) OR category ILIKE ANY(${p}) OR subject ILIKE ANY(${p}) OR creator ILIKE ANY(${p}))`;
+  }
   if (cursor)  { params.push(cursor);  where += ` AND id < $${params.length}`; }
   params.push(lim);
 
@@ -580,16 +632,27 @@ async function deleteAllReelsByOwner(ownerId) {
 
 /* "My uploads": reels owned by this account, plus older reels (no owner yet)
    posted under the given @handle. */
-async function listOwnReels(ownerId, handle) {
+/* Paged like the feed (no cap): returns one page plus the cursor for the
+   next one, and the creator's total upload count for the profile header. */
+async function listOwnReels(ownerId, handle, { limit = 30, cursor = null } = {}) {
   const owner = String(ownerId || '').trim().toLowerCase();
+  const lim = Math.min(50, Math.max(1, Number(limit) || 30));
   if (!HAS_DB) {
-    return memoryReels.filter((r) => (owner && r.owner_id === owner) || (!r.owner_id && handle && r.creator === handle)).slice(0, 100);
+    const all = memoryReels.filter((r) => (owner && r.owner_id === owner) || (!r.owner_id && handle && r.creator === handle));
+    const rest = cursor ? all.filter((r) => Number(r.id) < Number(cursor)) : all;
+    const page = rest.slice(0, lim);
+    return { items: page, total: all.length, nextCursor: page.length === lim && rest.length > lim ? String(page[page.length - 1].id) : null };
   }
-  const { rows } = await getPool().query(
-    `SELECT * FROM reels WHERE status='published' AND (owner_id=$1 OR (owner_id IS NULL AND creator=$2))
-     ORDER BY id DESC LIMIT 100`, [owner, handle || '']
-  );
-  return rows;
+  const base = `status='published' AND (owner_id=$1 OR (owner_id IS NULL AND creator=$2))`;
+  const params = [owner, handle || ''];
+  let where = base;
+  if (cursor) { params.push(cursor); where += ` AND id < $${params.length}`; }
+  params.push(lim);
+  const [{ rows }, count] = await Promise.all([
+    getPool().query(`SELECT * FROM reels WHERE ${where} ORDER BY id DESC LIMIT $${params.length}`, params),
+    getPool().query(`SELECT COUNT(*)::int AS n FROM reels WHERE ${base}`, [owner, handle || '']),
+  ]);
+  return { items: rows, total: count.rows[0].n, nextCursor: rows.length === lim ? String(rows[rows.length - 1].id) : null };
 }
 
 module.exports = {
