@@ -354,6 +354,10 @@ app.get('/api/feed', async (req, res) => {
       limit: req.query.limit,
       cursor: req.query.cursor || null,
       creator: req.query.creator || null,
+      creators: req.query.creators || null,
+      topics: req.query.topics || null,
+      q: req.query.q || null,
+      any: req.query.any || null,
     });
     res.json({ reels: items.map(reelsService.toClientReel), nextCursor });
   } catch (err) {
@@ -400,8 +404,10 @@ app.get('/api/my/reels', async (req, res) => {
   const me = session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
   if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
   try {
-    const rows = await reelsService.listOwnReels(me, String(req.query.creator || ''));
-    res.json({ ok: true, reels: rows.map(reelsService.toClientReel) });
+    const { items, total, nextCursor } = await reelsService.listOwnReels(me, String(req.query.creator || ''), {
+      limit: req.query.limit, cursor: req.query.cursor || null,
+    });
+    res.json({ ok: true, reels: items.map(reelsService.toClientReel), total, nextCursor });
   } catch (err) {
     console.error('my reels failed:', err);
     res.status(500).json({ ok: false, error: 'Could not load your reels' });
