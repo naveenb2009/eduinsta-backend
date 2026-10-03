@@ -324,13 +324,18 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
     if (!/^video\//.test(req.file.mimetype || '')) return res.status(400).json({ error: 'Only video files can be uploaded' });
     const ownerId = session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
     if (!ownerId) return res.status(401).json({ error: 'Please log out and log in again, then upload your reel.' });
-    const { title, description, category, subject, creator } = req.body;
-    if (!title || !creator) return res.status(400).json({ error: 'title and creator are required' });
+    const { description, category, subject, creator } = req.body;
+    if (!creator) return res.status(400).json({ error: 'creator is required' });
+    /* Title is optional for the uploader: blank falls back to the AI's
+       suggested title. Always one line, max 150 characters. */
+    const cleanTitle = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 150);
 
     const verdict = await moderateVideo(req.file.buffer, req.file.mimetype);
     if (!verdict.approved) {
       return res.status(422).json({ error: 'rejected', verdict });
     }
+    const title = cleanTitle(req.body.title) || cleanTitle(verdict.suggested_title)
+      || cleanTitle(verdict.subject ? `${verdict.subject} explained` : '') || 'Educational reel';
 
     const { key, url } = await reelsService.storeVideo(req.file.buffer, req.file.mimetype);
     const row = await reelsService.createReel({
@@ -347,6 +352,22 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
   }
 });
 
+/* The signed-in user's email from "Authorization: Bearer <token>", or null. */
+const signedInUser = (req) => session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
+/* Reels for the app, each with likedByMe for the signed-in user (so the red
+   heart is right on every phone, even after a reinstall). */
+async function reelsForClient(req, rows) {
+  const out = rows.map(reelsService.toClientReel);
+  const me = signedInUser(req);
+  if (me && out.length) {
+    try {
+      const liked = await reelsService.likedIds(me, out.map((r) => r.id));
+      out.forEach((r) => { r.likedByMe = liked.has(r.id); });
+    } catch (err) { console.warn('likedIds failed:', err.message); }
+  }
+  return out;
+}
+
 /* The shared feed. Keyset pagination — stays fast however deep you scroll. */
 app.get('/api/feed', async (req, res) => {
   try {
@@ -359,7 +380,7 @@ app.get('/api/feed', async (req, res) => {
       q: req.query.q || null,
       any: req.query.any || null,
     });
-    res.json({ reels: items.map(reelsService.toClientReel), nextCursor });
+    res.json({ reels: await reelsForClient(req, items), nextCursor });
   } catch (err) {
     console.error('feed failed:', err);
     res.status(500).json({ error: 'Could not load the feed' });
@@ -374,7 +395,7 @@ app.get('/api/reels/batch', async (req, res) => {
   try {
     const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
     const rows = await reelsService.getReelsByIds(ids);
-    res.json({ ok: true, reels: rows.map(reelsService.toClientReel) });
+    res.json({ ok: true, reels: await reelsForClient(req, rows) });
   } catch (err) {
     console.error('batch reel fetch failed:', err);
     res.status(500).json({ ok: false, reels: [] });
@@ -383,12 +404,38 @@ app.get('/api/reels/batch', async (req, res) => {
 
 app.post('/api/reels/:id/like', async (req, res) => {
   try {
-    const userId = req.body?.userId;
-    if (!userId) return res.status(400).json({ error: 'userId required' });
-    res.json(await reelsService.toggleLike(req.params.id, userId));
+    /* The liker is the signed-in account (token), never a userId the
+       request merely claims - otherwise anyone could inflate like counts. */
+    const userId = signedInUser(req);
+    if (!userId) return res.status(401).json({ error: 'Please log in again to like reels.' });
+    const want = typeof req.body?.liked === 'boolean' ? req.body.liked : undefined;
+    res.json(await reelsService.toggleLike(req.params.id, userId, want));
   } catch (err) {
     if (/not found/i.test(err && err.message)) return res.status(404).json({ error: 'Reel not found' });
     res.status(500).json({ error: 'Could not update the like' });
+  }
+});
+
+/* Share counter. Counts each share, but ignores repeats from the same
+   person/device on the same reel within 30 seconds (double taps, retries). */
+const recentShares = new Map();   // "reel|who" -> time
+app.post('/api/reels/:id/share', async (req, res) => {
+  try {
+    const who = signedInUser(req) || String(req.body?.deviceId || '').slice(0, 64) || req.ip;
+    const key = `${req.params.id}|${who}`;
+    const now = Date.now();
+    if (recentShares.size > 20000) for (const [k, t] of recentShares) if (now - t > 30000) recentShares.delete(k);
+    if (recentShares.has(key) && now - recentShares.get(key) < 30000) {
+      const [row] = await reelsService.getReelsByIds([req.params.id]);
+      if (!row) return res.status(404).json({ ok: false });
+      return res.json({ ok: true, counted: false, shares: Number(row.share_count || 0) });
+    }
+    recentShares.set(key, now);
+    const shares = await reelsService.addShare(req.params.id);
+    res.json({ ok: true, counted: true, shares });
+  } catch (err) {
+    if (/not found/i.test(err && err.message)) return res.status(404).json({ ok: false });
+    res.status(500).json({ ok: false });
   }
 });
 
@@ -407,7 +454,7 @@ app.get('/api/my/reels', async (req, res) => {
     const { items, total, nextCursor } = await reelsService.listOwnReels(me, String(req.query.creator || ''), {
       limit: req.query.limit, cursor: req.query.cursor || null,
     });
-    res.json({ ok: true, reels: items.map(reelsService.toClientReel), total, nextCursor });
+    res.json({ ok: true, reels: await reelsForClient(req, items), total, nextCursor });
   } catch (err) {
     console.error('my reels failed:', err);
     res.status(500).json({ ok: false, error: 'Could not load your reels' });
@@ -501,20 +548,39 @@ app.delete('/api/reels/:id', requireOwner, async (req, res) => {
    screens VIDEOS, never comment text). */
 app.post('/api/reels/:id/comments', async (req, res) => {
   try {
-    const { userId, username, text } = req.body || {};
-    if (!userId || !String(text || '').trim()) return res.status(400).json({ ok: false, error: 'Write something before posting.' });
+    const userId = signedInUser(req);
+    if (!userId) return res.status(401).json({ ok: false, error: 'Please log in again to comment.' });
+    const { username, text } = req.body || {};
+    if (!String(text || '').trim()) return res.status(400).json({ ok: false, error: 'Write something before posting.' });
     const row = await reelsService.addComment(req.params.id, userId, username, text);
-    res.json({ ok: true, comment: reelsService.toClientComment(row) });
+    const [comment] = await commentsForClient([row]);
+    res.json({ ok: true, comment, comments: row.comment_count });
   } catch (err) {
+    if (/not found/i.test(err && err.message)) return res.status(404).json({ ok: false, error: 'This reel no longer exists.' });
     console.error('add comment failed:', err);
     res.status(500).json({ ok: false, error: 'Could not post the comment' });
   }
 });
 
+/* Comments show the commenter's CURRENT account name (like Instagram), so a
+   name change in Edit profile also updates their earlier comments. Looked
+   up once per distinct commenter; the @handle is the fallback. */
+async function commentsForClient(rows) {
+  const names = new Map();
+  for (const id of new Set(rows.map((r) => String(r.user_id || '').toLowerCase()))) {
+    try { const u = await authService.getUser(id); if (u && u.name) names.set(id, u.name); } catch {}
+  }
+  return rows.map((r) => {
+    const c = reelsService.toClientComment(r);
+    c.name = names.get(String(r.user_id || '').toLowerCase()) || null;
+    return c;
+  });
+}
+
 app.get('/api/reels/:id/comments', async (req, res) => {
   try {
     const rows = await reelsService.listComments(req.params.id, { limit: req.query.limit });
-    res.json({ ok: true, comments: rows.map(reelsService.toClientComment) });
+    res.json({ ok: true, comments: await commentsForClient(rows) });
   } catch (err) {
     console.error('list comments failed:', err);
     res.status(500).json({ ok: false, comments: [] });
@@ -526,6 +592,21 @@ app.get('/api/reels/:id/comments', async (req, res) => {
    avatar is actually visible to OTHER users, not just stored locally on
    their own device.
    ------------------------------------------------------------------ */
+/* Edit profile -> name. Shown on the user's comments. */
+app.post('/api/profile/name', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  const name = String(req.body?.name || '').replace(/\s+/g, ' ').trim().slice(0, 50);
+  if (!name) return res.status(400).json({ ok: false, error: 'Enter your name.' });
+  try {
+    await authService.updateProfile(me, { name });
+    res.json({ ok: true, name });
+  } catch (err) {
+    console.error('update name failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not save your name' });
+  }
+});
+
 app.post('/api/profile/avatar', upload.single('avatar'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No image supplied' });
@@ -728,6 +809,7 @@ async function performAccountDeletion(userId) {
     // OWN reels are removed as a side effect of deleteAllReelsByCreator
     // below (deleting a reel cascades to its comments).
     await reelsService.deleteCommentsByUser(userId);
+    await reelsService.deleteLikesByUser(userId);
   } catch (err) {
     console.error('account deletion: failed to delete comments for', userId, err);
   }
