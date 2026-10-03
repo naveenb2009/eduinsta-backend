@@ -209,6 +209,19 @@ async function initSchema() {
     -- kept in sync with reel_likes; comment_count with reel_comments.
     ALTER TABLE reels ADD COLUMN IF NOT EXISTS comment_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE reels ADD COLUMN IF NOT EXISTS share_count   INTEGER NOT NULL DEFAULT 0;
+    -- Replies (one level, like Instagram) and hearts on comments.
+    ALTER TABLE reel_comments ADD COLUMN IF NOT EXISTS parent_id BIGINT;
+    ALTER TABLE reel_comments ADD COLUMN IF NOT EXISTS likes INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX IF NOT EXISTS reel_comments_parent_idx ON reel_comments (parent_id);
+    CREATE TABLE IF NOT EXISTS comment_likes (
+      comment_id BIGINT NOT NULL,
+      user_id    TEXT   NOT NULL,
+      PRIMARY KEY (comment_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS comment_likes_user_idx ON comment_likes (user_id);
+    -- When each like happened, so "who liked this" lists newest first.
+    ALTER TABLE reel_likes ADD COLUMN IF NOT EXISTS liked_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    CREATE INDEX IF NOT EXISTS reel_likes_reel_time_idx ON reel_likes (reel_id, liked_at DESC, user_id);
     -- One-time catch-up for comments posted before the counter existed.
     UPDATE reels r SET comment_count = c.n
       FROM (SELECT reel_id, COUNT(*)::int AS n FROM reel_comments GROUP BY reel_id) c
@@ -352,6 +365,43 @@ async function toggleLike(reelId, userId, want) {
   } finally {
     client.release();
   }
+}
+
+/* Who liked a reel, newest first, one page at a time (no cap). Returns
+   account ids only; the server turns them into display names. */
+async function listLikers(reelId, { limit = 30, cursor = null } = {}) {
+  const lim = Math.min(100, Math.max(1, Number(limit) || 30));
+  if (!HAS_DB) {
+    const r = memoryReels.find((x) => String(x.id) === String(reelId));
+    if (!r) throw new Error('not found');
+    const all = [...(r._likers || [])].reverse();
+    const start = Math.max(0, Number(cursor) || 0);
+    const page = all.slice(start, start + lim);
+    return { users: page, total: all.length, nextCursor: start + lim < all.length ? String(start + lim) : null };
+  }
+  const exists = await getPool().query('SELECT likes FROM reels WHERE id=$1', [reelId]);
+  if (!exists.rowCount) throw new Error('not found');
+  const params = [reelId];
+  let where = 'reel_id=$1';
+  if (cursor) {
+    const [ts, ...rest] = String(cursor).split('|');
+    const user = rest.join('|');
+    // Exact Postgres timestamp text (microseconds kept); anything else is ignored.
+    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,6})?([+-]\d{2}(:?\d{2})?|Z)?$/.test(ts || '')) {
+      params.push(ts, user);
+      where += ` AND (liked_at, user_id) < ($2::timestamptz, $3)`;
+    }
+  }
+  params.push(lim);
+  const { rows } = await getPool().query(
+    `SELECT user_id, liked_at::text AS ts FROM reel_likes WHERE ${where} ORDER BY liked_at DESC, user_id DESC LIMIT $${params.length}`, params
+  );
+  const last = rows[rows.length - 1];
+  return {
+    users: rows.map((x) => x.user_id),
+    total: Number(exists.rows[0].likes || 0),
+    nextCursor: rows.length === lim ? `${last.ts}|${last.user_id}` : null,
+  };
 }
 
 /* Which of these reels has this user liked? Lets the app show the red heart
@@ -531,21 +581,31 @@ async function deleteAvatar(userId) {
    not whether they're reviewed before appearing.
    ------------------------------------------------------------------ */
 const MAX_COMMENT_LENGTH = 300;
-const memoryComments = new Map();   // String(reelId) -> [{id,reel_id,user_id,username,text,created_at}]
+const memoryComments = new Map();   // String(reelId) -> [{id,reel_id,parent_id,user_id,username,text,likes,created_at}]
+const memoryCommentLikes = new Map(); // String(commentId) -> Set(userId)
 
-async function addComment(reelId, userId, username, text) {
+/* Replies are one level deep, like Instagram: replying to a reply attaches
+   it to the same top-level comment. A reply counts as a comment in the
+   reel's comment total. */
+async function addComment(reelId, userId, username, text, parentId = null) {
   const clean = String(text || '').trim().slice(0, MAX_COMMENT_LENGTH);
   if (!clean) throw new Error('Comment text is required');
   if (!userId) throw new Error('userId is required');
 
   if (!HAS_DB) {
-    const row = {
-      id: nextMemoryId(), reel_id: reelId, user_id: userId,
-      username: username || userId, text: clean, created_at: new Date().toISOString(),
-    };
     const reel = memoryReels.find((x) => String(x.id) === String(reelId));
     if (!reel) throw new Error('not found');
     const arr = memoryComments.get(String(reelId)) || [];
+    let parent = null;
+    if (parentId != null && parentId !== '') {
+      const p = arr.find((c) => String(c.id) === String(parentId));
+      if (!p) throw new Error('parent not found');
+      parent = p.parent_id || p.id;
+    }
+    const row = {
+      id: nextMemoryId(), reel_id: reelId, parent_id: parent, user_id: userId,
+      username: username || userId, text: clean, likes: 0, created_at: new Date().toISOString(),
+    };
     arr.push(row);
     memoryComments.set(String(reelId), arr);
     reel.comment_count = arr.length;
@@ -553,22 +613,29 @@ async function addComment(reelId, userId, username, text) {
     return row;
   }
 
+  let parent = null;
+  if (parentId != null && parentId !== '') {
+    const { rows: pr } = await getPool().query(
+      'SELECT id, parent_id FROM reel_comments WHERE id=$1 AND reel_id=$2', [parentId, reelId]
+    );
+    if (!pr.length) throw new Error('parent not found');
+    parent = pr[0].parent_id || pr[0].id;
+  }
   const upd = await getPool().query(
     'UPDATE reels SET comment_count = comment_count + 1 WHERE id=$1 RETURNING comment_count', [reelId]
   );
   if (!upd.rowCount) throw new Error('not found');
   const { rows } = await getPool().query(
-    `INSERT INTO reel_comments (reel_id, user_id, username, text) VALUES ($1,$2,$3,$4) RETURNING *`,
-    [reelId, userId, username || userId, clean]
+    `INSERT INTO reel_comments (reel_id, parent_id, user_id, username, text) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [reelId, parent, userId, username || userId, clean]
   );
   rows[0].comment_count = upd.rows[0].comment_count;
   return rows[0];
 }
 
-/* Oldest-first, capped — matches how the app already renders them (each
-   new comment appended to the bottom of the list). */
-async function listComments(reelId, { limit = 200 } = {}) {
-  const lim = Math.min(300, Math.max(1, Number(limit) || 200));
+/* Oldest-first (the app groups replies under their comment). */
+async function listComments(reelId, { limit = 2000 } = {}) {
+  const lim = Math.min(2000, Math.max(1, Number(limit) || 2000));
 
   if (!HAS_DB) {
     const arr = memoryComments.get(String(reelId)) || [];
@@ -581,28 +648,92 @@ async function listComments(reelId, { limit = 200 } = {}) {
   return rows;
 }
 
+/* Heart on a comment: one per user, set (want=true/false) or toggle. */
+async function likeComment(commentId, userId, want) {
+  if (!HAS_DB) {
+    let row = null;
+    for (const arr of memoryComments.values()) { row = arr.find((c) => String(c.id) === String(commentId)); if (row) break; }
+    if (!row) throw new Error('not found');
+    const set = memoryCommentLikes.get(String(commentId)) || new Set();
+    const liked = typeof want === 'boolean' ? want : !set.has(userId);
+    liked ? set.add(userId) : set.delete(userId);
+    memoryCommentLikes.set(String(commentId), set);
+    row.likes = set.size;
+    return { liked, likes: row.likes };
+  }
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const exists = await client.query('SELECT 1 FROM reel_comments WHERE id=$1', [commentId]);
+    if (!exists.rowCount) throw new Error('not found');
+    const had = (await client.query('SELECT 1 FROM comment_likes WHERE comment_id=$1 AND user_id=$2', [commentId, userId])).rowCount > 0;
+    const liked = typeof want === 'boolean' ? want : !had;
+    if (liked && !had) await client.query('INSERT INTO comment_likes (comment_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [commentId, userId]);
+    if (!liked && had) await client.query('DELETE FROM comment_likes WHERE comment_id=$1 AND user_id=$2', [commentId, userId]);
+    const { rows } = await client.query(
+      'UPDATE reel_comments SET likes = (SELECT COUNT(*) FROM comment_likes WHERE comment_id=$1) WHERE id=$1 RETURNING likes', [commentId]
+    );
+    await client.query('COMMIT');
+    return { liked, likes: rows[0]?.likes ?? 0 };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/* Which of these comments has this user hearted? */
+async function likedCommentIds(userId, commentIds) {
+  const ids = (commentIds || []).map(Number).filter(Number.isFinite);
+  if (!userId || !ids.length) return new Set();
+  if (!HAS_DB) return new Set(ids.filter((id) => (memoryCommentLikes.get(String(id)) || new Set()).has(userId)));
+  const { rows } = await getPool().query(
+    'SELECT comment_id FROM comment_likes WHERE user_id=$1 AND comment_id = ANY($2::bigint[])', [userId, ids]
+  );
+  return new Set(rows.map((r) => Number(r.comment_id)));
+}
+
 async function deleteCommentsForReel(reelId) {
-  if (!HAS_DB) { memoryComments.delete(String(reelId)); return; }
+  if (!HAS_DB) {
+    (memoryComments.get(String(reelId)) || []).forEach((c) => memoryCommentLikes.delete(String(c.id)));
+    memoryComments.delete(String(reelId));
+    return;
+  }
+  await getPool().query('DELETE FROM comment_likes WHERE comment_id IN (SELECT id FROM reel_comments WHERE reel_id=$1)', [reelId]);
   await getPool().query('DELETE FROM reel_comments WHERE reel_id=$1', [reelId]);
 }
 
-/* Removes every comment a user has ever POSTED, including on other
-   people's reels -- used by account deletion. (Comments ON their own
-   reels are already covered by deleteCommentsForReel via deleteReel /
-   deleteAllReelsByCreator.) */
+/* Account deletion: removes every comment the user POSTED (anywhere), the
+   replies under those comments, and every comment heart they gave; then
+   fixes the affected counts. */
 async function deleteCommentsByUser(userId) {
   if (!HAS_DB) {
     let removed = 0;
     for (const [key, arr] of memoryComments) {
-      const kept = arr.filter((c) => c.user_id !== userId);
+      const gone = new Set(arr.filter((c) => c.user_id === userId).map((c) => String(c.id)));
+      const kept = arr.filter((c) => !gone.has(String(c.id)) && !(c.parent_id && gone.has(String(c.parent_id))));
+      arr.filter((c) => !kept.includes(c)).forEach((c) => memoryCommentLikes.delete(String(c.id)));
       removed += arr.length - kept.length;
       memoryComments.set(key, kept);
       const reel = memoryReels.find((x) => String(x.id) === key);
       if (reel) reel.comment_count = kept.length;
     }
+    for (const [cid, set] of memoryCommentLikes) {
+      if (set.delete(userId)) {
+        for (const arr of memoryComments.values()) { const c = arr.find((x) => String(x.id) === cid); if (c) c.likes = set.size; }
+      }
+    }
     return removed;
   }
-  const { rows } = await getPool().query('DELETE FROM reel_comments WHERE user_id=$1 RETURNING reel_id', [userId]);
+  const { rows } = await getPool().query(
+    `DELETE FROM reel_comments WHERE user_id=$1
+        OR parent_id IN (SELECT id FROM reel_comments WHERE user_id=$1)
+     RETURNING id, reel_id`, [userId]
+  );
+  if (rows.length) {
+    await getPool().query('DELETE FROM comment_likes WHERE comment_id = ANY($1::bigint[])', [rows.map((r) => Number(r.id))]);
+  }
   const touched = [...new Set(rows.map((r) => Number(r.reel_id)))];
   if (touched.length) {
     await getPool().query(
@@ -610,11 +741,22 @@ async function deleteCommentsByUser(userId) {
        WHERE id = ANY($1::bigint[])`, [touched]
     );
   }
+  const { rows: liked } = await getPool().query('DELETE FROM comment_likes WHERE user_id=$1 RETURNING comment_id', [userId]);
+  const likedIds = [...new Set(liked.map((r) => Number(r.comment_id)))];
+  if (likedIds.length) {
+    await getPool().query(
+      `UPDATE reel_comments SET likes = (SELECT COUNT(*) FROM comment_likes l WHERE l.comment_id = reel_comments.id)
+       WHERE id = ANY($1::bigint[])`, [likedIds]
+    );
+  }
   return rows.length;
 }
 
 function toClientComment(row) {
-  return { id: Number(row.id), user: row.username || row.user_id, text: row.text, createdAt: row.created_at };
+  return {
+    id: Number(row.id), parentId: row.parent_id == null ? null : Number(row.parent_id),
+    user: row.username || row.user_id, text: row.text, likes: Number(row.likes || 0), createdAt: row.created_at,
+  };
 }
 
 /* Fetch a single published reel by id - used by the /reel/:id shareable
@@ -733,7 +875,7 @@ async function listOwnReels(ownerId, handle, { limit = 30, cursor = null } = {})
 
 module.exports = {
   deleteOwnReel, deleteAllReelsByOwner, listOwnReels,
-  likedIds, addShare, deleteLikesByUser,
+  likedIds, addShare, deleteLikesByUser, likeComment, likedCommentIds, listLikers,
   initSchema, storeVideo, readVideo, createReel, listReels, getReel, getReelsByIds,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   storeImage, setAvatar, getAvatars, deleteAvatar,
