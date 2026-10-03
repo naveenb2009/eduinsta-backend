@@ -77,4 +77,29 @@ function consumeTicket(ticket, target) {
   return rec.exp > Date.now() && rec.target === norm(target);
 }
 
-module.exports = { issueToken, verifyToken, isSignedInAs, issueTicket, consumeTicket };
+/* Education Check receipt. When the AI approves a video, the app gets a
+   signed receipt bound to that exact file (SHA-256), that account and a
+   2-hour window. Publishing the same file with a valid receipt skips a
+   second AI check; anything that doesn't match is checked again. */
+const CHECK_TTL_MS = 2 * 60 * 60 * 1000;
+function fileHash(buffer) { return crypto.createHash('sha256').update(buffer).digest('hex'); }
+function issueCheckReceipt(email, buffer, verdict) {
+  const body = b64u(JSON.stringify({
+    h: fileHash(buffer), u: norm(email), exp: Date.now() + CHECK_TTL_MS,
+    c: verdict.category || '', s: verdict.subject || '', t: verdict.suggested_title || '',
+  }));
+  return `${body}.${sign('check.' + body)}`;
+}
+/* Returns the approved verdict if the receipt is genuine and matches this
+   file and account; otherwise null (the caller then runs the AI check). */
+function verifyCheckReceipt(receipt, email, buffer) {
+  const [body, sig] = String(receipt || '').split('.');
+  if (!body || !sig) return null;
+  const expected = Buffer.from(sign('check.' + body)), given = Buffer.from(sig);
+  if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) return null;
+  let d; try { d = JSON.parse(Buffer.from(body, 'base64url').toString()); } catch { return null; }
+  if (!d || Date.now() > d.exp || d.u !== norm(email) || d.h !== fileHash(buffer)) return null;
+  return { status: 'approved', approved: true, category: d.c, subject: d.s, suggested_title: d.t || null, fromReceipt: true };
+}
+
+module.exports = { issueToken, verifyToken, isSignedInAs, issueTicket, consumeTicket, issueCheckReceipt, verifyCheckReceipt };
