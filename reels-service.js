@@ -204,6 +204,15 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS reel_comments_reel_idx ON reel_comments (reel_id, id);
     CREATE INDEX IF NOT EXISTS reel_comments_user_idx ON reel_comments (user_id);
+
+    -- Engagement counters shown on every reel (like Instagram). likes is
+    -- kept in sync with reel_likes; comment_count with reel_comments.
+    ALTER TABLE reels ADD COLUMN IF NOT EXISTS comment_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE reels ADD COLUMN IF NOT EXISTS share_count   INTEGER NOT NULL DEFAULT 0;
+    -- One-time catch-up for comments posted before the counter existed.
+    UPDATE reels r SET comment_count = c.n
+      FROM (SELECT reel_id, COUNT(*)::int AS n FROM reel_comments GROUP BY reel_id) c
+     WHERE r.id = c.reel_id AND r.comment_count <> c.n;
   `);
   if (!HAS_R2) console.warn('⚠️  No R2 configured — videos are held in memory and lost on restart.');
 }
@@ -214,7 +223,7 @@ async function createReel({ creator, title, description, category, subject, vide
     const row = {
       id: nextMemoryId(), creator, title, description, category, subject, owner_id: ownerId,
       video_key: videoKey, video_url: videoUrl, status: 'published',
-      likes: 0, views: 0, created_at: new Date().toISOString(),
+      likes: 0, views: 0, comment_count: 0, share_count: 0, created_at: new Date().toISOString(),
     };
     memoryReels.unshift(row);
     return row;
@@ -307,13 +316,15 @@ async function listReels({ limit = 10, cursor = null, creator = null, creators =
 }
 
 /* Likes are per-user rows, so the count can't be inflated by tapping twice
-   and survives the user reinstalling the app. */
-async function toggleLike(reelId, userId) {
+   and survives the user reinstalling the app. `want` = true (like) / false
+   (unlike) sets the state explicitly, so a phone that forgot its local like
+   state can't accidentally remove a like; without it the like toggles. */
+async function toggleLike(reelId, userId, want) {
   if (!HAS_DB) {
     const r = memoryReels.find((x) => String(x.id) === String(reelId));
     if (!r) throw new Error('not found');
     r._likers = r._likers || new Set();
-    const liked = !r._likers.has(userId);
+    const liked = typeof want === 'boolean' ? want : !r._likers.has(userId);
     liked ? r._likers.add(userId) : r._likers.delete(userId);
     r.likes = r._likers.size;
     return { liked, likes: r.likes };
@@ -321,17 +332,14 @@ async function toggleLike(reelId, userId) {
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');
-    const existing = await client.query(
+    const exists = await client.query('SELECT 1 FROM reels WHERE id=$1', [reelId]);
+    if (!exists.rowCount) throw new Error('not found');
+    const had = (await client.query(
       'SELECT 1 FROM reel_likes WHERE reel_id=$1 AND user_id=$2', [reelId, userId]
-    );
-    let liked;
-    if (existing.rowCount) {
-      await client.query('DELETE FROM reel_likes WHERE reel_id=$1 AND user_id=$2', [reelId, userId]);
-      liked = false;
-    } else {
-      await client.query('INSERT INTO reel_likes (reel_id,user_id) VALUES ($1,$2)', [reelId, userId]);
-      liked = true;
-    }
+    )).rowCount > 0;
+    const liked = typeof want === 'boolean' ? want : !had;
+    if (liked && !had) await client.query('INSERT INTO reel_likes (reel_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [reelId, userId]);
+    if (!liked && had) await client.query('DELETE FROM reel_likes WHERE reel_id=$1 AND user_id=$2', [reelId, userId]);
     const { rows } = await client.query(
       `UPDATE reels SET likes = (SELECT COUNT(*) FROM reel_likes WHERE reel_id=$1)
        WHERE id=$1 RETURNING likes`, [reelId]
@@ -344,6 +352,54 @@ async function toggleLike(reelId, userId) {
   } finally {
     client.release();
   }
+}
+
+/* Which of these reels has this user liked? Lets the app show the red heart
+   correctly on any phone, even after a reinstall. */
+async function likedIds(userId, reelIds) {
+  const ids = (reelIds || []).map(Number).filter(Number.isFinite);
+  if (!userId || !ids.length) return new Set();
+  if (!HAS_DB) {
+    return new Set(memoryReels.filter((r) => r._likers && r._likers.has(userId) && ids.includes(Number(r.id))).map((r) => Number(r.id)));
+  }
+  const { rows } = await getPool().query(
+    'SELECT reel_id FROM reel_likes WHERE user_id=$1 AND reel_id = ANY($2::bigint[])', [userId, ids]
+  );
+  return new Set(rows.map((r) => Number(r.reel_id)));
+}
+
+/* Account deletion: remove every like this user gave and fix the counts. */
+async function deleteLikesByUser(userId) {
+  if (!userId) return 0;
+  if (!HAS_DB) {
+    let n = 0;
+    memoryReels.forEach((r) => { if (r._likers && r._likers.delete(userId)) { n++; r.likes = r._likers.size; } });
+    return n;
+  }
+  const { rows } = await getPool().query('DELETE FROM reel_likes WHERE user_id=$1 RETURNING reel_id', [userId]);
+  const touched = [...new Set(rows.map((r) => Number(r.reel_id)))];
+  if (touched.length) {
+    await getPool().query(
+      `UPDATE reels SET likes = (SELECT COUNT(*) FROM reel_likes l WHERE l.reel_id = reels.id) WHERE id = ANY($1::bigint[])`, [touched]
+    );
+  }
+  return rows.length;
+}
+
+/* A share is counted each time someone shares the reel (the server rate-
+   limits repeats from the same person). Returns the new total. */
+async function addShare(reelId) {
+  if (!HAS_DB) {
+    const r = memoryReels.find((x) => String(x.id) === String(reelId));
+    if (!r) throw new Error('not found');
+    r.share_count = (r.share_count || 0) + 1;
+    return r.share_count;
+  }
+  const { rows } = await getPool().query(
+    'UPDATE reels SET share_count = share_count + 1 WHERE id=$1 RETURNING share_count', [reelId]
+  );
+  if (!rows.length) throw new Error('not found');
+  return rows[0].share_count;
 }
 
 async function incrementViews(reelId) {
@@ -487,16 +543,25 @@ async function addComment(reelId, userId, username, text) {
       id: nextMemoryId(), reel_id: reelId, user_id: userId,
       username: username || userId, text: clean, created_at: new Date().toISOString(),
     };
+    const reel = memoryReels.find((x) => String(x.id) === String(reelId));
+    if (!reel) throw new Error('not found');
     const arr = memoryComments.get(String(reelId)) || [];
     arr.push(row);
     memoryComments.set(String(reelId), arr);
+    reel.comment_count = arr.length;
+    row.comment_count = reel.comment_count;
     return row;
   }
 
+  const upd = await getPool().query(
+    'UPDATE reels SET comment_count = comment_count + 1 WHERE id=$1 RETURNING comment_count', [reelId]
+  );
+  if (!upd.rowCount) throw new Error('not found');
   const { rows } = await getPool().query(
     `INSERT INTO reel_comments (reel_id, user_id, username, text) VALUES ($1,$2,$3,$4) RETURNING *`,
     [reelId, userId, username || userId, clean]
   );
+  rows[0].comment_count = upd.rows[0].comment_count;
   return rows[0];
 }
 
@@ -532,11 +597,20 @@ async function deleteCommentsByUser(userId) {
       const kept = arr.filter((c) => c.user_id !== userId);
       removed += arr.length - kept.length;
       memoryComments.set(key, kept);
+      const reel = memoryReels.find((x) => String(x.id) === key);
+      if (reel) reel.comment_count = kept.length;
     }
     return removed;
   }
-  const { rowCount } = await getPool().query('DELETE FROM reel_comments WHERE user_id=$1', [userId]);
-  return rowCount;
+  const { rows } = await getPool().query('DELETE FROM reel_comments WHERE user_id=$1 RETURNING reel_id', [userId]);
+  const touched = [...new Set(rows.map((r) => Number(r.reel_id)))];
+  if (touched.length) {
+    await getPool().query(
+      `UPDATE reels SET comment_count = (SELECT COUNT(*) FROM reel_comments c WHERE c.reel_id = reels.id)
+       WHERE id = ANY($1::bigint[])`, [touched]
+    );
+  }
+  return rows.length;
 }
 
 function toClientComment(row) {
@@ -583,7 +657,9 @@ function toClientReel(row) {
     cat: row.category,
     sub: row.subject,
     src: row.video_url,
-    likes: row.likes,
+    likes: Number(row.likes || 0),
+    comments: Number(row.comment_count || 0),
+    shares: Number(row.share_count || 0),
     views: row.views,
     createdAt: row.created_at,
   };
@@ -657,6 +733,7 @@ async function listOwnReels(ownerId, handle, { limit = 30, cursor = null } = {})
 
 module.exports = {
   deleteOwnReel, deleteAllReelsByOwner, listOwnReels,
+  likedIds, addShare, deleteLikesByUser,
   initSchema, storeVideo, readVideo, createReel, listReels, getReel, getReelsByIds,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   storeImage, setAvatar, getAvatars, deleteAvatar,
