@@ -294,10 +294,16 @@ function escapeHtmlSrv(s) {
 app.post('/api/education-check', upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ status: 'error', reason: 'No video supplied' });
   if (!/^video\//.test(req.file.mimetype || '')) return res.status(400).json({ status: 'error', reason: 'Please choose a video file.' });
-  if (!session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''))) {
+  const checker = session.verifyToken((req.headers.authorization || '').replace('Bearer ', ''));
+  if (!checker) {
     return res.status(401).json({ status: 'error', reason: 'Please log out and log in again, then try uploading.' });
   }
   const result = await moderateVideo(req.file.buffer, req.file.mimetype);
+  /* A real AI approval gets a receipt so Publish doesn't run the AI again.
+     (An "unreviewed" pass - AI unavailable - gets none, so Publish retries.) */
+  if (result.approved && !result.unreviewed) {
+    result.checkReceipt = session.issueCheckReceipt(checker, req.file.buffer, result);
+  }
   if (result.status === 'manual_review' || result.status === 'rejected') {
     db.moderationQueue = db.moderationQueue || [];
     db.moderationQueue.push({
@@ -330,7 +336,10 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
        suggested title. Always one line, max 150 characters. */
     const cleanTitle = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 150);
 
-    const verdict = await moderateVideo(req.file.buffer, req.file.mimetype);
+    /* Already approved by the Education Check for this exact file and
+       account? Then don't run (and pay for) the AI a second time. */
+    const verdict = session.verifyCheckReceipt(req.body.checkReceipt, ownerId, req.file.buffer)
+      || await moderateVideo(req.file.buffer, req.file.mimetype);
     if (!verdict.approved) {
       return res.status(422).json({ error: 'rejected', verdict });
     }
