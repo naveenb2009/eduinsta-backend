@@ -425,6 +425,29 @@ app.post('/api/reels/:id/like', async (req, res) => {
   }
 });
 
+/* "Who liked this reel" (tap the like count). Names only - never emails.
+   Signed-in users only, so the list can't be scraped anonymously. */
+app.get('/api/reels/:id/likes', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again to see likes.' });
+  try {
+    const { users, total, nextCursor } = await reelsService.listLikers(req.params.id, {
+      limit: req.query.limit, cursor: req.query.cursor || null,
+    });
+    const likers = [];
+    for (const id of users) {
+      let name = null;
+      try { const u = await authService.getUser(id); name = u && u.name; } catch {}
+      likers.push({ name: name || 'EduInsta user', you: String(id).toLowerCase() === me });
+    }
+    res.json({ ok: true, total, likers, nextCursor });
+  } catch (err) {
+    if (/not found/i.test(err && err.message)) return res.status(404).json({ ok: false, error: 'This reel no longer exists.' });
+    console.error('list likers failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load likes' });
+  }
+});
+
 /* Share counter. Counts each share, but ignores repeats from the same
    person/device on the same reel within 30 seconds (double taps, retries). */
 const recentShares = new Map();   // "reel|who" -> time
@@ -559,12 +582,13 @@ app.post('/api/reels/:id/comments', async (req, res) => {
   try {
     const userId = signedInUser(req);
     if (!userId) return res.status(401).json({ ok: false, error: 'Please log in again to comment.' });
-    const { username, text } = req.body || {};
+    const { username, text, parentId } = req.body || {};
     if (!String(text || '').trim()) return res.status(400).json({ ok: false, error: 'Write something before posting.' });
-    const row = await reelsService.addComment(req.params.id, userId, username, text);
-    const [comment] = await commentsForClient([row]);
+    const row = await reelsService.addComment(req.params.id, userId, username, text, parentId ?? null);
+    const [comment] = await commentsForClient([row], req);
     res.json({ ok: true, comment, comments: row.comment_count });
   } catch (err) {
+    if (/parent not found/i.test(err && err.message)) return res.status(404).json({ ok: false, error: 'That comment was deleted.' });
     if (/not found/i.test(err && err.message)) return res.status(404).json({ ok: false, error: 'This reel no longer exists.' });
     console.error('add comment failed:', err);
     res.status(500).json({ ok: false, error: 'Could not post the comment' });
@@ -574,7 +598,12 @@ app.post('/api/reels/:id/comments', async (req, res) => {
 /* Comments show the commenter's CURRENT account name (like Instagram), so a
    name change in Edit profile also updates their earlier comments. Looked
    up once per distinct commenter; the @handle is the fallback. */
-async function commentsForClient(rows) {
+async function commentsForClient(rows, req) {
+  const me = req ? signedInUser(req) : null;
+  let mine = new Set();
+  if (me && rows.length) {
+    try { mine = await reelsService.likedCommentIds(me, rows.map((r) => r.id)); } catch (err) { console.warn('likedCommentIds failed:', err.message); }
+  }
   const names = new Map();
   for (const id of new Set(rows.map((r) => String(r.user_id || '').toLowerCase()))) {
     try { const u = await authService.getUser(id); if (u && u.name) names.set(id, u.name); } catch {}
@@ -582,14 +611,30 @@ async function commentsForClient(rows) {
   return rows.map((r) => {
     const c = reelsService.toClientComment(r);
     c.name = names.get(String(r.user_id || '').toLowerCase()) || null;
+    if (me) c.likedByMe = mine.has(c.id);
     return c;
   });
 }
 
+/* Heart on a comment (signed-in users only, one per person). */
+app.post('/api/comments/:id/like', async (req, res) => {
+  try {
+    const userId = signedInUser(req);
+    if (!userId) return res.status(401).json({ ok: false, error: 'Please log in again to like comments.' });
+    const want = typeof req.body?.liked === 'boolean' ? req.body.liked : undefined;
+    const r = await reelsService.likeComment(req.params.id, userId, want);
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    if (/not found/i.test(err && err.message)) return res.status(404).json({ ok: false, error: 'That comment was deleted.' });
+    console.error('comment like failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not update the like' });
+  }
+});
+
 app.get('/api/reels/:id/comments', async (req, res) => {
   try {
     const rows = await reelsService.listComments(req.params.id, { limit: req.query.limit });
-    res.json({ ok: true, comments: await commentsForClient(rows) });
+    res.json({ ok: true, comments: await commentsForClient(rows, req) });
   } catch (err) {
     console.error('list comments failed:', err);
     res.status(500).json({ ok: false, comments: [] });
