@@ -37,6 +37,16 @@ const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
 const subscriptionsService = require('./subscriptions-service');
 const followsService = require('./follows-service');
+const reportsService = require('./reports-service');
+const pushService = require('./push-service');
+const { videoDurationSeconds, MAX_VIDEO_SECONDS } = require('./video-duration');
+/* Reels can be at most 3 minutes. Null when the length can't be read from
+   the file (then it's allowed; the app also checks on the phone). */
+function tooLong(file) {
+  const d = videoDurationSeconds(file.buffer, file.mimetype);
+  return d != null && d > MAX_VIDEO_SECONDS + 0.5 ? d : null;
+}
+const tooLongMessage = (d) => `This video is ${Math.floor(d / 60)}:${String(Math.round(d % 60)).padStart(2, '0')} long. Reels can be at most 3 minutes - please trim it and try again.`;
 const session = require('./session-service');
 const campaignsService = require('./campaigns-service');
 const reelsService = require('./reels-service');
@@ -188,6 +198,31 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+/* Settings > Sign-in & security > Change password: needs the current
+   password (and the signed-in session), same rules as sign-up. */
+const isValidPassword = (pw) => {
+  pw = String(pw || '');
+  return pw.length >= 8 && pw.length <= 32 && /^[A-Za-z]/.test(pw) && /[0-9]/.test(pw) && /[^A-Za-z0-9]/.test(pw);
+};
+app.post('/api/change-password', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log out and log in again, then change your password.' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ ok: false, error: 'Enter your current and new password.' });
+  if (!isValidPassword(newPassword)) return res.status(400).json({ ok: false, error: 'New password: 8-32 characters, start with a letter, and include a number and a special character.' });
+  if (currentPassword === newPassword) return res.status(400).json({ ok: false, error: 'The new password must be different from the current one.' });
+  try {
+    const check = await authService.verifyPassword(me, currentPassword);
+    if (!check.ok) return res.status(403).json({ ok: false, error: 'Your current password is not correct.' });
+    const result = await authService.updatePassword(me, newPassword);
+    if (!result.ok) return res.status(500).json({ ok: false, error: 'Could not change your password.' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('change-password failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not change your password. Please try again.' });
+  }
+});
+
 app.post('/api/reset-password', async (req, res) => {
   try {
     const { email, newPassword, ticket } = req.body || {};
@@ -219,7 +254,12 @@ app.post('/api/reset-password', async (req, res) => {
 app.post('/api/reports', async (req, res) => {
   try {
     const { reelId, reason, details, userId } = req.body || {};
-    if (!reelId || !reason) return res.status(400).json({ ok: false, error: 'reelId and reason are required' });
+    const kind = reportsService.KINDS.includes(req.body?.kind) ? req.body.kind : 'reel';
+    const targetId = req.body?.targetId ?? reelId;
+    if (!targetId || !reason) return res.status(400).json({ ok: false, error: 'Choose a reason for the report' });
+    const reporter = signedInUser(req);
+    await reportsService.create({ kind, targetId, reason, details, reporterPid: reporter ? session.publicId(reporter) : null });
+    if (kind !== 'reel') return res.json({ ok: true });
     const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
     const result = await diagnosticsService.logEvent({
       type: 'report',
@@ -307,6 +347,8 @@ app.post('/api/education-check', upload.single('video'), async (req, res) => {
   if (!checker) {
     return res.status(401).json({ status: 'error', reason: 'Please log out and log in again, then try uploading.' });
   }
+  const long = tooLong(req.file);
+  if (long) return res.status(400).json({ status: 'error', reason: tooLongMessage(long) });
   const result = await moderateVideo(req.file.buffer, req.file.mimetype);
   /* A real AI approval gets a receipt so Publish doesn't run the AI again.
      (An "unreviewed" pass - AI unavailable - gets none, so Publish retries.) */
@@ -341,6 +383,8 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
     if (!ownerId) return res.status(401).json({ error: 'Please log out and log in again, then upload your reel.' });
     const { description, category, subject, creator } = req.body;
     if (!creator) return res.status(400).json({ error: 'creator is required' });
+    const long = tooLong(req.file);
+    if (long) return res.status(400).json({ error: tooLongMessage(long) });
     /* Title is optional for the uploader: blank falls back to the AI's
        suggested title. Always one line, max 150 characters. */
     const cleanTitle = (t) => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 150);
@@ -396,7 +440,10 @@ app.get('/api/feed', async (req, res) => {
   try {
     /* Following tab: reels from the accounts the signed-in user follows. */
     let owners = null;
-    if (req.query.following) {
+    if (req.query.ownerPid) {               // one person's reels (their profile page)
+      const p = await followsService.getPerson(String(req.query.ownerPid));
+      owners = p ? [p.email] : [];
+    } else if (req.query.following) {
       const me = signedInUser(req);
       if (!me) return res.status(401).json({ reels: [], nextCursor: null, error: 'Please log in again.' });
       owners = await followsService.followeeEmails(me);
@@ -606,6 +653,9 @@ app.post('/api/reels/:id/comments', async (req, res) => {
     if (!userId) return res.status(401).json({ ok: false, error: 'Please log in again to comment.' });
     const { username, text, parentId } = req.body || {};
     if (!String(text || '').trim()) return res.status(400).json({ ok: false, error: 'Write something before posting.' });
+    if (OFFENSIVE_RE.test(String(text))) {
+      return res.status(422).json({ ok: false, error: 'Please keep comments respectful — this comment contains offensive words.' });
+    }
     // The reel owner's "Who can comment" setting
     const target = await reelsService.getReel(req.params.id);
     if (!target) return res.status(404).json({ ok: false, error: 'This reel no longer exists.' });
@@ -627,6 +677,11 @@ app.post('/api/reels/:id/comments', async (req, res) => {
     res.status(500).json({ ok: false, error: 'Could not post the comment' });
   }
 });
+
+/* Comments with abusive words are refused (same list as the app's
+   "Filter offensive words"). Whole words only, so "Classic" etc. pass. */
+const OFFENSIVE_WORDS = ['fuck','fucking','fucker','shit','bitch','bastard','asshole','dick','cunt','slut','whore','motherfucker','retard','nigger','faggot','chutiya','chutiye','madarchod','behenchod','bhenchod','bsdk','bhosdike','gandu','randi','harami','kutta','kutti','saala','sala','loda','lauda','lavde','boli','sule','bolimaga','soolemaga','tika','thika','nanmagne'];
+const OFFENSIVE_RE = new RegExp('(^|[^a-z])(' + OFFENSIVE_WORDS.join('|') + ')(?=$|[^a-z])', 'i');
 
 /* Who hears about a new comment (each person once, most specific reason):
    people @mentioned -> "mentioned you"; the author of the comment being
@@ -658,6 +713,9 @@ async function notifyAboutComment(email, row, mentioned) {
    up once per distinct commenter; the @handle is the fallback. */
 async function commentsForClient(rows, req) {
   const me = req ? signedInUser(req) : null;
+  // Who may delete: the comment's author, and the uploader of the reel.
+  let reelOwner = null;
+  if (me && rows.length) { try { const r = await reelsService.getReel(rows[0].reel_id); reelOwner = r && r.owner_id ? String(r.owner_id).toLowerCase() : null; } catch {} }
   let mine = new Set();
   if (me && rows.length) {
     try { mine = await reelsService.likedCommentIds(me, rows.map((r) => r.id)); } catch (err) { console.warn('likedCommentIds failed:', err.message); }
@@ -669,10 +727,90 @@ async function commentsForClient(rows, req) {
   return rows.map((r) => {
     const c = reelsService.toClientComment(r);
     c.name = names.get(String(r.user_id || '').toLowerCase()) || null;
-    if (me) c.likedByMe = mine.has(c.id);
+    c.pid = session.publicId(r.user_id);
+    if (me) {
+      c.likedByMe = mine.has(c.id);
+      c.mine = String(r.user_id || '').toLowerCase() === me;
+      c.canDelete = c.mine || (!!reelOwner && reelOwner === me);
+    }
     return c;
   });
 }
+
+/* Delete a comment (and its replies): its author, or the reel's uploader. */
+app.delete('/api/comments/:id', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  try {
+    const c = await reelsService.getComment(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: 'This comment was already deleted.' });
+    const reel = await reelsService.getReel(c.reel_id).catch(() => null);
+    const isAuthor = String(c.user_id || '').toLowerCase() === me;
+    const isReelOwner = reel && String(reel.owner_id || '').toLowerCase() === me;
+    if (!isAuthor && !isReelOwner) return res.status(403).json({ ok: false, error: 'You can only delete your own comments or comments on your reels.' });
+    const reelId = await reelsService.deleteComment(req.params.id);
+    const [fresh] = reelId ? await reelsService.getReelsByIds([reelId]) : [];
+    res.json({ ok: true, comments: fresh ? Number(fresh.comment_count || 0) : null });
+  } catch (err) {
+    console.error('delete comment failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not delete the comment' });
+  }
+});
+
+/* ---------------- Owner: reports queue ---------------- */
+async function reportPreview(g) {
+  const base = process.env.PUBLIC_BASE_URL || '';
+  if (g.kind === 'reel') {
+    const r = await reelsService.getReel(g.targetId).catch(() => null);
+    return r ? { title: r.title, by: r.creator, link: `${base}/reel/${r.id}` } : null;
+  }
+  if (g.kind === 'comment') {
+    const c = await reelsService.getComment(g.targetId).catch(() => null);
+    if (!c) return null;
+    const p = await followsService.getPerson(session.publicId(c.user_id)).catch(() => null);
+    return { text: c.text, by: (p && p.name) || c.username, reelId: Number(c.reel_id), link: `${base}/reel/${c.reel_id}` };
+  }
+  const p = await followsService.getPerson(g.targetId).catch(() => null);
+  return p ? { name: p.name, handle: p.handle } : null;
+}
+app.get('/api/owner/reports', requireOwner, async (_req, res) => {
+  try {
+    const groups = await reportsService.listOpen();
+    const out = [];
+    for (const g of groups) {
+      const preview = await reportPreview(g);
+      if (!preview) { await reportsService.resolve(g.kind, g.targetId, 'removed'); continue; }   // already gone
+      out.push({ ...g, preview });
+    }
+    res.json({ ok: true, reports: out });
+  } catch (err) {
+    console.error('owner reports failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load reports' });
+  }
+});
+/* Remove the reported reel / comment / account, and close its reports. */
+app.post('/api/owner/reports/remove', requireOwner, async (req, res) => {
+  const { kind, targetId } = req.body || {};
+  try {
+    if (kind === 'reel') await reelsService.deleteReelById(targetId);
+    else if (kind === 'comment') await reelsService.deleteComment(targetId);
+    else if (kind === 'account') {
+      const p = await followsService.getPerson(targetId);
+      if (p && p.email) await performAccountDeletion(p.email);
+    } else return res.status(400).json({ ok: false, error: 'Unknown report type' });
+    await reportsService.resolve(kind, targetId, 'removed');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('owner remove failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not remove it' });
+  }
+});
+app.post('/api/owner/reports/dismiss', requireOwner, async (req, res) => {
+  const { kind, targetId } = req.body || {};
+  if (!reportsService.KINDS.includes(kind)) return res.status(400).json({ ok: false });
+  await reportsService.resolve(kind, targetId, 'dismissed').catch(() => {});
+  res.json({ ok: true });
+});
 
 /* Heart on a comment (signed-in users only, one per person). */
 app.post('/api/comments/:id/like', async (req, res) => {
@@ -722,23 +860,68 @@ app.post('/api/me/presence', async (req, res) => {
   if (!me) return res.status(401).json({ ok: false });
   try {
     await followsService.setPresence(me, { showActive: req.body?.showActive, allowMentions: req.body?.allowMentions, commentPermission: req.body?.commentPermission });
+    if (req.body?.notify) await pushService.setPrefs(session.publicId(me), req.body.notify);
     res.json({ ok: true });
   } catch (err) {
     console.error('presence failed:', err);
     res.status(500).json({ ok: false });
   }
 });
+/* Push notifications: the phone registers its token for the signed-in
+   account, and removes it on logout. */
+app.post('/api/push/register', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false });
+  const ok = await pushService.register(session.publicId(me), req.body?.token).catch(() => false);
+  res.json({ ok, enabled: pushService.isConfigured() });
+});
+app.post('/api/push/unregister', async (req, res) => {
+  await pushService.unregister(req.body?.token).catch(() => {});
+  res.json({ ok: true });
+});
+
 /* "@" suggestions while typing a comment. */
 app.get('/api/people/search', async (req, res) => {
   const me = signedInUser(req);
   if (!me) return res.status(401).json({ ok: false, people: [] });
   try {
-    res.json({ ok: true, people: await followsService.searchPeople(req.query.q, session.publicId(me)) });
+    // scope=all: the Search screen (everyone); default: @mention suggestions
+    // (only people who allow mentions).
+    const all = req.query.scope === 'all';
+    if (all && !String(req.query.q || '').trim()) return res.json({ ok: true, people: [] });
+    res.json({ ok: true, people: await followsService.searchPeople(req.query.q, session.publicId(me), all ? 20 : 8, { forMentions: !all }) });
   } catch (err) {
     console.error('people search failed:', err);
     res.status(500).json({ ok: false, people: [] });
   }
 });
+/* A person's public profile: name, @handle, counts, follow state. */
+app.get('/api/people/:pid', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  try {
+    const pid = String(req.params.pid);
+    const p = await followsService.getPerson(pid);
+    if (!p) return res.status(404).json({ ok: false, error: 'This account no longer exists.' });
+    const myPid = session.publicId(me);
+    const [c, reels, act, youFollow, followsYou] = await Promise.all([
+      followsService.counts(pid),
+      reelsService.listOwnReels(p.email, '', { limit: 1 }),
+      followsService.activeTimes(myPid, [pid]),
+      followsService.isFollowing(myPid, pid),
+      followsService.isFollowing(pid, myPid),
+    ]);
+    res.json({
+      ok: true, pid, name: p.name || 'EduInsta user', handle: p.handle || null,
+      followers: c.followers, following: c.following, reels: reels.total || 0,
+      youFollow, followsYou, you: pid === myPid, activeAt: act.get(pid) || null,
+    });
+  } catch (err) {
+    console.error('profile failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load the profile' });
+  }
+});
+
 /* My notifications newer than ?since=<id> (mentions, replies, comments on
    my reels, new followers). */
 app.get('/api/notifications', async (req, res) => {
@@ -1061,6 +1244,7 @@ async function performAccountDeletion(userId) {
     // below (deleting a reel cascades to its comments).
     await reelsService.deleteCommentsByUser(userId);
     await reelsService.deleteLikesByUser(userId);
+    await pushService.removeAccount(session.publicId(userId));
     await followsService.deleteUser(userId);
   } catch (err) {
     console.error('account deletion: failed to delete comments for', userId, err);
@@ -1352,7 +1536,7 @@ app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_H
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema(), followsService.initSchema()])
+Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema(), followsService.initSchema(), reportsService.initSchema(), pushService.initSchema()])
   .then(() => {
     app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`));
     followsService.backfill().then((n) => n && console.log(`people: added ${n} existing accounts`)).catch((e) => console.warn('people backfill failed:', e.message));
