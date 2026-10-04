@@ -161,6 +161,7 @@ app.post('/api/signup', async (req, res) => {
     }
     await authService.createUser({ email, name, phone, password });
     await followsService.upsertPerson({ email, name }).catch((e) => console.warn('people upsert failed:', e.message));
+    followsService.noteLogin(email, req.body?.deviceId, { alert: false }).catch(() => {});
     res.json({ ok: true, token: session.issueToken(email), pid: session.publicId(email) });
   } catch (err) {
     console.error('signup failed:', err);
@@ -174,7 +175,10 @@ app.post('/api/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password are required' });
     const result = await authService.verifyPassword(email, password);
     if (result.ok) {
-      authService.getUser(email).then((u) => followsService.upsertPerson({ email, name: u && u.name })).catch(() => {});
+      authService.getUser(email)
+        .then((u) => followsService.upsertPerson({ email, name: u && u.name }))
+        .then(() => followsService.noteLogin(email, req.body?.deviceId))
+        .catch(() => {});
       return res.json({ ...result, token: session.issueToken(email), pid: session.publicId(email) });
     }
     res.status(result.notFound ? 404 : 401).json(result);
@@ -375,6 +379,10 @@ async function reelsForClient(req, rows) {
   const out = rows.map(reelsService.toClientReel);
   const me = signedInUser(req);
   if (me && out.length) {
+    try {
+      const act = await followsService.activeTimes(session.publicId(me), out.map((r) => r.creatorId));
+      out.forEach((r) => { if (act.has(r.creatorId)) r.creatorActiveAt = act.get(r.creatorId); });
+    } catch (err) { console.warn('activeTimes failed:', err.message); }
     try {
       const liked = await reelsService.likedIds(me, out.map((r) => r.id));
       out.forEach((r) => { r.likedByMe = liked.has(r.id); });
@@ -598,7 +606,18 @@ app.post('/api/reels/:id/comments', async (req, res) => {
     if (!userId) return res.status(401).json({ ok: false, error: 'Please log in again to comment.' });
     const { username, text, parentId } = req.body || {};
     if (!String(text || '').trim()) return res.status(400).json({ ok: false, error: 'Write something before posting.' });
-    const row = await reelsService.addComment(req.params.id, userId, username, text, parentId ?? null);
+    // The reel owner's "Who can comment" setting
+    const target = await reelsService.getReel(req.params.id);
+    if (!target) return res.status(404).json({ ok: false, error: 'This reel no longer exists.' });
+    if (target.owner_id) {
+      const allowed = await followsService.canComment(target.owner_id, userId);
+      if (!allowed.ok) return res.status(403).json({ ok: false, error: allowed.reason });
+    }
+    // @mentions of real people who allow it (highlighted in the app + notified)
+    const myPid = session.publicId(userId);
+    const mentioned = (await followsService.resolveMentions(text).catch(() => [])).filter((m) => m.allow && m.pid !== myPid);
+    const row = await reelsService.addComment(req.params.id, userId, username, text, parentId ?? null, mentioned.map((m) => m.handle.toLowerCase()));
+    notifyAboutComment(userId, row, mentioned).catch((e) => console.warn('comment notifications failed:', e.message));
     const [comment] = await commentsForClient([row], req);
     res.json({ ok: true, comment, comments: row.comment_count });
   } catch (err) {
@@ -608,6 +627,31 @@ app.post('/api/reels/:id/comments', async (req, res) => {
     res.status(500).json({ ok: false, error: 'Could not post the comment' });
   }
 });
+
+/* Who hears about a new comment (each person once, most specific reason):
+   people @mentioned -> "mentioned you"; the author of the comment being
+   replied to -> "replied to your comment"; the reel's uploader ->
+   "commented on your reel". Never yourself. */
+async function notifyAboutComment(email, row, mentioned) {
+  const fromPid = session.publicId(email);
+  const me = await followsService.getPerson(fromPid);
+  const name = (me && me.name) || ((await authService.getUser(email).catch(() => null)) || {}).name || 'Someone';
+  const quote = `“${String(row.text || '').slice(0, 80)}${String(row.text || '').length > 80 ? '…' : ''}”`;
+  const reelId = Number(row.reel_id);
+  const done = new Set([fromPid]);
+  for (const m of mentioned) {
+    if (done.has(m.pid)) continue; done.add(m.pid);
+    await followsService.notify(m.pid, 'mention', fromPid, `${name} mentioned you: ${quote}`, reelId);
+  }
+  if (row.parent_id) {
+    const parent = await reelsService.getComment(row.parent_id);
+    const pp = parent && session.publicId(parent.user_id);
+    if (pp && !done.has(pp)) { done.add(pp); await followsService.notify(pp, 'reply', fromPid, `${name} replied to your comment: ${quote}`, reelId); }
+  }
+  const reel = await reelsService.getReel(reelId);
+  const op = reel && reel.owner_id && session.publicId(reel.owner_id);
+  if (op && !done.has(op)) await followsService.notify(op, 'comment', fromPid, `${name} commented on your reel: ${quote}`, reelId);
+}
 
 /* Comments show the commenter's CURRENT account name (like Instagram), so a
    name change in Edit profile also updates their earlier comments. Looked
@@ -648,7 +692,15 @@ app.post('/api/comments/:id/like', async (req, res) => {
 app.get('/api/reels/:id/comments', async (req, res) => {
   try {
     const rows = await reelsService.listComments(req.params.id, { limit: req.query.limit });
-    res.json({ ok: true, comments: await commentsForClient(rows, req) });
+    // Can the viewer comment here? (owner's "Who can comment" setting)
+    let canComment = true, commentNote = null;
+    const viewer = signedInUser(req);
+    const reel = await reelsService.getReel(req.params.id).catch(() => null);
+    if (viewer && reel && reel.owner_id) {
+      const c = await followsService.canComment(reel.owner_id, viewer).catch(() => ({ ok: true }));
+      canComment = c.ok; commentNote = c.reason || null;
+    }
+    res.json({ ok: true, comments: await commentsForClient(rows, req), canComment, commentNote });
   } catch (err) {
     console.error('list comments failed:', err);
     res.status(500).json({ ok: false, comments: [] });
@@ -663,6 +715,56 @@ app.get('/api/reels/:id/comments', async (req, res) => {
 /* ------------------------------------------------------------------
    FOLLOWERS / FOLLOWING (stored on the server; by account, not @handle)
    ------------------------------------------------------------------ */
+/* The app reports it's in use (every couple of minutes while open) and the
+   user's "Show active status" / "Allow mentions" switches. */
+app.post('/api/me/presence', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false });
+  try {
+    await followsService.setPresence(me, { showActive: req.body?.showActive, allowMentions: req.body?.allowMentions, commentPermission: req.body?.commentPermission });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('presence failed:', err);
+    res.status(500).json({ ok: false });
+  }
+});
+/* "@" suggestions while typing a comment. */
+app.get('/api/people/search', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, people: [] });
+  try {
+    res.json({ ok: true, people: await followsService.searchPeople(req.query.q, session.publicId(me)) });
+  } catch (err) {
+    console.error('people search failed:', err);
+    res.status(500).json({ ok: false, people: [] });
+  }
+});
+/* My notifications newer than ?since=<id> (mentions, replies, comments on
+   my reels, new followers). */
+app.get('/api/notifications', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, notifications: [] });
+  try {
+    res.json({ ok: true, notifications: await followsService.listNotifications(session.publicId(me), req.query.since) });
+  } catch (err) {
+    console.error('notifications failed:', err);
+    res.status(500).json({ ok: false, notifications: [] });
+  }
+});
+
+/* Settings > Your activity: totals for this account (any phone). */
+app.get('/api/me/activity', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  try {
+    const [a, f] = await Promise.all([reelsService.activityCounts(me), followsService.counts(session.publicId(me))]);
+    res.json({ ok: true, likes: a.likes, comments: a.comments, following: f.following, followers: f.followers });
+  } catch (err) {
+    console.error('activity failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load your activity' });
+  }
+});
+
 /* My counts + everyone I follow (ids) - the app uses this for Follow buttons. */
 app.get('/api/follows/me', async (req, res) => {
   const me = signedInUser(req);
@@ -705,6 +807,8 @@ app.get('/api/follows/list', async (req, res) => {
       followsService.list(pid, kind, myPid, { limit: req.query.limit, offset: req.query.offset }),
       followsService.counts(pid),
     ]);
+    const act = await followsService.activeTimes(myPid, page.people.map((x) => x.pid)).catch(() => new Map());
+    page.people.forEach((x) => { if (act.has(x.pid)) x.activeAt = act.get(x.pid); });
     res.json({ ok: true, kind, ...c, people: page.people, nextOffset: page.nextOffset });
   } catch (err) {
     console.error('follows list failed:', err);
