@@ -212,6 +212,9 @@ async function initSchema() {
     -- Replies (one level, like Instagram) and hearts on comments.
     ALTER TABLE reel_comments ADD COLUMN IF NOT EXISTS parent_id BIGINT;
     ALTER TABLE reel_comments ADD COLUMN IF NOT EXISTS likes INTEGER NOT NULL DEFAULT 0;
+    -- @handles in the comment that point at real people (JSON array), so the
+    -- app can highlight them.
+    ALTER TABLE reel_comments ADD COLUMN IF NOT EXISTS mentions TEXT;
     CREATE INDEX IF NOT EXISTS reel_comments_parent_idx ON reel_comments (parent_id);
     CREATE TABLE IF NOT EXISTS comment_likes (
       comment_id BIGINT NOT NULL,
@@ -222,6 +225,7 @@ async function initSchema() {
     -- When each like happened, so "who liked this" lists newest first.
     ALTER TABLE reel_likes ADD COLUMN IF NOT EXISTS liked_at TIMESTAMPTZ NOT NULL DEFAULT now();
     CREATE INDEX IF NOT EXISTS reel_likes_reel_time_idx ON reel_likes (reel_id, liked_at DESC, user_id);
+    CREATE INDEX IF NOT EXISTS reel_likes_user_idx ON reel_likes (user_id);
     -- One-time catch-up for comments posted before the counter existed.
     UPDATE reels r SET comment_count = c.n
       FROM (SELECT reel_id, COUNT(*)::int AS n FROM reel_comments GROUP BY reel_id) c
@@ -409,6 +413,25 @@ async function listLikers(reelId, { limit = 30, cursor = null } = {}) {
   };
 }
 
+/* "Your activity": how many reels this account has liked and how many
+   comments (incl. replies) it has posted - from the server, so it's right
+   on every phone. */
+async function activityCounts(userId) {
+  const u = String(userId || '').toLowerCase();
+  if (!u) return { likes: 0, comments: 0 };
+  if (!HAS_DB) {
+    let likes = 0, comments = 0;
+    memoryReels.forEach((r) => { if (r._likers && r._likers.has(u)) likes++; });
+    for (const arr of memoryComments.values()) comments += arr.filter((c) => String(c.user_id).toLowerCase() === u).length;
+    return { likes, comments };
+  }
+  const { rows } = await getPool().query(
+    `SELECT (SELECT COUNT(*)::int FROM reel_likes l JOIN reels r ON r.id = l.reel_id WHERE l.user_id=$1) AS likes,
+            (SELECT COUNT(*)::int FROM reel_comments c JOIN reels r ON r.id = c.reel_id WHERE c.user_id=$1) AS comments`, [u]
+  );
+  return rows[0];
+}
+
 /* Which of these reels has this user liked? Lets the app show the red heart
    correctly on any phone, even after a reinstall. */
 async function likedIds(userId, reelIds) {
@@ -592,7 +615,7 @@ const memoryCommentLikes = new Map(); // String(commentId) -> Set(userId)
 /* Replies are one level deep, like Instagram: replying to a reply attaches
    it to the same top-level comment. A reply counts as a comment in the
    reel's comment total. */
-async function addComment(reelId, userId, username, text, parentId = null) {
+async function addComment(reelId, userId, username, text, parentId = null, mentions = null) {
   const clean = String(text || '').trim().slice(0, MAX_COMMENT_LENGTH);
   if (!clean) throw new Error('Comment text is required');
   if (!userId) throw new Error('userId is required');
@@ -610,6 +633,7 @@ async function addComment(reelId, userId, username, text, parentId = null) {
     const row = {
       id: nextMemoryId(), reel_id: reelId, parent_id: parent, user_id: userId,
       username: username || userId, text: clean, likes: 0, created_at: new Date().toISOString(),
+      mentions: mentions && mentions.length ? JSON.stringify(mentions) : null,
     };
     arr.push(row);
     memoryComments.set(String(reelId), arr);
@@ -631,8 +655,8 @@ async function addComment(reelId, userId, username, text, parentId = null) {
   );
   if (!upd.rowCount) throw new Error('not found');
   const { rows } = await getPool().query(
-    `INSERT INTO reel_comments (reel_id, parent_id, user_id, username, text) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [reelId, parent, userId, username || userId, clean]
+    `INSERT INTO reel_comments (reel_id, parent_id, user_id, username, text, mentions) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [reelId, parent, userId, username || userId, clean, mentions && mentions.length ? JSON.stringify(mentions) : null]
   );
   rows[0].comment_count = upd.rows[0].comment_count;
   return rows[0];
@@ -757,8 +781,22 @@ async function deleteCommentsByUser(userId) {
   return rows.length;
 }
 
+function getCommentSync(id) {
+  for (const arr of memoryComments.values()) { const c = arr.find((x) => String(x.id) === String(id)); if (c) return c; }
+  return null;
+}
+/* One comment (for reply notifications: who wrote the parent). */
+async function getComment(id) {
+  if (!HAS_DB) return getCommentSync(id);
+  const { rows } = await getPool().query('SELECT * FROM reel_comments WHERE id=$1', [id]);
+  return rows[0] || null;
+}
+
 function toClientComment(row) {
+  let mentions = [];
+  try { mentions = row.mentions ? JSON.parse(row.mentions) : []; } catch {}
   return {
+    mentions: Array.isArray(mentions) ? mentions.map((h) => String(h).toLowerCase()) : [],
     id: Number(row.id), parentId: row.parent_id == null ? null : Number(row.parent_id),
     user: row.username || row.user_id, text: row.text, likes: Number(row.likes || 0), createdAt: row.created_at,
   };
@@ -882,7 +920,7 @@ async function listOwnReels(ownerId, handle, { limit = 30, cursor = null } = {})
 
 module.exports = {
   deleteOwnReel, deleteAllReelsByOwner, listOwnReels,
-  likedIds, addShare, deleteLikesByUser, likeComment, likedCommentIds, listLikers,
+  getComment, activityCounts, likedIds, addShare, deleteLikesByUser, likeComment, likedCommentIds, listLikers,
   initSchema, storeVideo, readVideo, createReel, listReels, getReel, getReelsByIds,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   storeImage, setAvatar, getAvatars, deleteAvatar,
