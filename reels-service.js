@@ -679,6 +679,7 @@ async function listComments(reelId, { limit = 2000 } = {}) {
 
 /* Heart on a comment: one per user, set (want=true/false) or toggle. */
 async function likeComment(commentId, userId, want) {
+  if (!/^\d{1,18}$/.test(String(commentId ?? ''))) throw new Error('not found');
   if (!HAS_DB) {
     let row = null;
     for (const arr of memoryComments.values()) { row = arr.find((c) => String(c.id) === String(commentId)); if (row) break; }
@@ -787,6 +788,7 @@ function getCommentSync(id) {
 }
 /* One comment (for reply notifications: who wrote the parent). */
 async function getComment(id) {
+  if (!/^\d{1,18}$/.test(String(id ?? ''))) return null;   // not a comment id (avoids a database error)
   if (!HAS_DB) return getCommentSync(id);
   const { rows } = await getPool().query('SELECT * FROM reel_comments WHERE id=$1', [id]);
   return rows[0] || null;
@@ -879,6 +881,52 @@ async function deleteOwnReel(reelId, ownerId) {
   return true;
 }
 
+/* Owner moderation: remove any reel by id (video, comments, likes too). */
+async function deleteReelById(reelId) {
+  if (!/^\d{1,18}$/.test(String(reelId ?? ''))) return false;
+  if (!HAS_DB) {
+    const i = memoryReels.findIndex((x) => String(x.id) === String(reelId));
+    if (i < 0) return false;
+    const [row] = memoryReels.splice(i, 1);
+    await removeReelRow(row);
+    return true;
+  }
+  const { rows } = await getPool().query('DELETE FROM reels WHERE id=$1 RETURNING id, video_key', [reelId]);
+  if (!rows.length) return false;
+  await removeReelRow(rows[0]);
+  return true;
+}
+
+/* Delete one comment and the replies under it, with their hearts; fixes the
+   reel's comment count. Returns the reel id, or null if it didn't exist. */
+async function deleteComment(commentId) {
+  if (!/^\d{1,18}$/.test(String(commentId ?? ''))) return null;
+  if (!HAS_DB) {
+    for (const [key, arr] of memoryComments) {
+      const c = arr.find((x) => String(x.id) === String(commentId));
+      if (!c) continue;
+      const gone = arr.filter((x) => String(x.id) === String(commentId) || String(x.parent_id) === String(commentId));
+      gone.forEach((x) => memoryCommentLikes.delete(String(x.id)));
+      const kept = arr.filter((x) => !gone.includes(x));
+      memoryComments.set(key, kept);
+      const reel = memoryReels.find((x) => String(x.id) === key);
+      if (reel) reel.comment_count = kept.length;
+      return Number(c.reel_id);
+    }
+    return null;
+  }
+  const { rows } = await getPool().query(
+    'DELETE FROM reel_comments WHERE id=$1 OR parent_id=$1 RETURNING id, reel_id', [commentId]
+  );
+  if (!rows.length) return null;
+  await getPool().query('DELETE FROM comment_likes WHERE comment_id = ANY($1::bigint[])', [rows.map((r) => Number(r.id))]);
+  const reelId = Number(rows[0].reel_id);
+  await getPool().query(
+    'UPDATE reels SET comment_count = (SELECT COUNT(*) FROM reel_comments WHERE reel_id=$1) WHERE id=$1', [reelId]
+  );
+  return reelId;
+}
+
 /* Every reel owned by this account (used by account deletion). */
 async function deleteAllReelsByOwner(ownerId) {
   const owner = String(ownerId || '').trim().toLowerCase();
@@ -920,7 +968,7 @@ async function listOwnReels(ownerId, handle, { limit = 30, cursor = null } = {})
 
 module.exports = {
   deleteOwnReel, deleteAllReelsByOwner, listOwnReels,
-  getComment, activityCounts, likedIds, addShare, deleteLikesByUser, likeComment, likedCommentIds, listLikers,
+  deleteReelById, deleteComment, getComment, activityCounts, likedIds, addShare, deleteLikesByUser, likeComment, likedCommentIds, listLikers,
   initSchema, storeVideo, readVideo, createReel, listReels, getReel, getReelsByIds,
   toggleLike, incrementViews, deleteReel, deleteAllReelsByCreator, toClientReel,
   storeImage, setAvatar, getAvatars, deleteAvatar,
