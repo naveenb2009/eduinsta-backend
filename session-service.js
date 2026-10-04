@@ -102,4 +102,11 @@ function verifyCheckReceipt(receipt, email, buffer) {
   return { status: 'approved', approved: true, category: d.c, subject: d.s, suggested_title: d.t || null, fromReceipt: true };
 }
 
-module.exports = { issueToken, verifyToken, isSignedInAs, issueTicket, consumeTicket, issueCheckReceipt, verifyCheckReceipt };
+/* Public id for a person (shown to other users instead of their email).
+   Stable for an account, can't be turned back into the email. */
+function publicId(email) {
+  const e = norm(email);
+  return e ? 'u' + sign('pid.' + e).replace(/[^A-Za-z0-9]/g, '').slice(0, 20) : null;
+}
+
+module.exports = { publicId, issueToken, verifyToken, isSignedInAs, issueTicket, consumeTicket, issueCheckReceipt, verifyCheckReceipt };
