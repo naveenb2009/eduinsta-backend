@@ -36,6 +36,7 @@ const Razorpay = require('razorpay');
 const { requestOtp, verifyOtp } = require('./otp-service');
 const { moderateVideo } = require('./moderation-service');
 const subscriptionsService = require('./subscriptions-service');
+const followsService = require('./follows-service');
 const session = require('./session-service');
 const campaignsService = require('./campaigns-service');
 const reelsService = require('./reels-service');
@@ -159,7 +160,8 @@ app.post('/api/signup', async (req, res) => {
       return res.status(409).json({ ok: false, error: 'An account with this email already exists.' });
     }
     await authService.createUser({ email, name, phone, password });
-    res.json({ ok: true, token: session.issueToken(email) });
+    await followsService.upsertPerson({ email, name }).catch((e) => console.warn('people upsert failed:', e.message));
+    res.json({ ok: true, token: session.issueToken(email), pid: session.publicId(email) });
   } catch (err) {
     console.error('signup failed:', err);
     res.status(500).json({ ok: false, error: 'Could not create your account. Please try again.' });
@@ -171,7 +173,10 @@ app.post('/api/login', async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password are required' });
     const result = await authService.verifyPassword(email, password);
-    if (result.ok) return res.json({ ...result, token: session.issueToken(email) });
+    if (result.ok) {
+      authService.getUser(email).then((u) => followsService.upsertPerson({ email, name: u && u.name })).catch(() => {});
+      return res.json({ ...result, token: session.issueToken(email), pid: session.publicId(email) });
+    }
     res.status(result.notFound ? 404 : 401).json(result);
   } catch (err) {
     console.error('login failed:', err);
@@ -347,6 +352,7 @@ app.post('/api/reels', upload.single('video'), async (req, res) => {
       || cleanTitle(verdict.subject ? `${verdict.subject} explained` : '') || 'Educational reel';
 
     const { key, url } = await reelsService.storeVideo(req.file.buffer, req.file.mimetype);
+    followsService.upsertPerson({ email: ownerId, handle: creator }).catch(() => {});
     const row = await reelsService.createReel({
       creator, title,
       description: description || '',
@@ -380,7 +386,15 @@ async function reelsForClient(req, rows) {
 /* The shared feed. Keyset pagination — stays fast however deep you scroll. */
 app.get('/api/feed', async (req, res) => {
   try {
+    /* Following tab: reels from the accounts the signed-in user follows. */
+    let owners = null;
+    if (req.query.following) {
+      const me = signedInUser(req);
+      if (!me) return res.status(401).json({ reels: [], nextCursor: null, error: 'Please log in again.' });
+      owners = await followsService.followeeEmails(me);
+    }
     const { items, nextCursor } = await reelsService.listReels({
+      owners,
       limit: req.query.limit,
       cursor: req.query.cursor || null,
       creator: req.query.creator || null,
@@ -646,6 +660,84 @@ app.get('/api/reels/:id/comments', async (req, res) => {
    avatar is actually visible to OTHER users, not just stored locally on
    their own device.
    ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------
+   FOLLOWERS / FOLLOWING (stored on the server; by account, not @handle)
+   ------------------------------------------------------------------ */
+/* My counts + everyone I follow (ids) - the app uses this for Follow buttons. */
+app.get('/api/follows/me', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  try {
+    const pid = session.publicId(me);
+    const [c, ids] = await Promise.all([followsService.counts(pid), followsService.followingIds(me)]);
+    res.json({ ok: true, pid, followers: c.followers, following: c.following, followingIds: ids });
+  } catch (err) {
+    console.error('follows/me failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load followers' });
+  }
+});
+/* Follow / unfollow: { pid, follow: true|false }. */
+app.post('/api/follows', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log out and log in again to follow people.' });
+  const pid = String(req.body?.pid || '');
+  const want = req.body?.follow !== false;
+  try {
+    const r = await followsService.setFollow(me, pid, want);
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    const m = err && err.message;
+    if (m === 'self') return res.status(400).json({ ok: false, error: "You can't follow yourself." });
+    if (m === 'not found') return res.status(404).json({ ok: false, error: 'This account no longer exists.' });
+    console.error('follow failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not update follow' });
+  }
+});
+/* Followers / following list (mine by default), 50 per page. */
+app.get('/api/follows/list', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  const kind = req.query.kind === 'following' ? 'following' : 'followers';
+  const myPid = session.publicId(me);
+  const pid = String(req.query.pid || myPid);
+  try {
+    const [page, c] = await Promise.all([
+      followsService.list(pid, kind, myPid, { limit: req.query.limit, offset: req.query.offset }),
+      followsService.counts(pid),
+    ]);
+    res.json({ ok: true, kind, ...c, people: page.people, nextOffset: page.nextOffset });
+  } catch (err) {
+    console.error('follows list failed:', err);
+    res.status(500).json({ ok: false, error: 'Could not load the list' });
+  }
+});
+/* One-time move of follows that were saved only on this phone (by
+   @handle) onto the account. Handles used by more than one person are
+   skipped rather than guessed. */
+app.post('/api/follows/migrate', async (req, res) => {
+  const me = signedInUser(req);
+  if (!me) return res.status(401).json({ ok: false });
+  const handles = (Array.isArray(req.body?.handles) ? req.body.handles : []).slice(0, 300);
+  let moved = 0;
+  for (const h of handles) {
+    try {
+      let pid = await followsService.pidByHandle(h);
+      if (!pid) {
+        // The handle may have changed since: use the account that posted
+        // reels under it, if that's exactly one account.
+        const { items } = await reelsService.listReels({ creator: String(h), limit: 50 });
+        const owners = [...new Set(items.map((r) => r.owner_id).filter(Boolean))];
+        if (owners.length === 1) pid = session.publicId(owners[0]);
+        if (pid && !(await followsService.getPerson(pid))) {
+          await followsService.upsertPerson({ email: owners[0] });
+        }
+      }
+      if (pid && pid !== session.publicId(me)) { await followsService.setFollow(me, pid, true); moved++; }
+    } catch {}
+  }
+  res.json({ ok: true, moved });
+});
+
 /* Edit profile -> name. Shown on the user's comments. */
 app.post('/api/profile/name', async (req, res) => {
   const me = signedInUser(req);
@@ -654,7 +746,8 @@ app.post('/api/profile/name', async (req, res) => {
   if (!name) return res.status(400).json({ ok: false, error: 'Enter your name.' });
   try {
     await authService.updateProfile(me, { name });
-    res.json({ ok: true, name });
+    await followsService.upsertPerson({ email: me, name, handle: req.body?.handle });
+    res.json({ ok: true, name, pid: session.publicId(me) });
   } catch (err) {
     console.error('update name failed:', err);
     res.status(500).json({ ok: false, error: 'Could not save your name' });
@@ -864,6 +957,7 @@ async function performAccountDeletion(userId) {
     // below (deleting a reel cascades to its comments).
     await reelsService.deleteCommentsByUser(userId);
     await reelsService.deleteLikesByUser(userId);
+    await followsService.deleteUser(userId);
   } catch (err) {
     console.error('account deletion: failed to delete comments for', userId, err);
   }
@@ -1154,6 +1248,9 @@ app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_H
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema()])
-  .then(() => app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`)))
+Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema(), followsService.initSchema()])
+  .then(() => {
+    app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`));
+    followsService.backfill().then((n) => n && console.log(`people: added ${n} existing accounts`)).catch((e) => console.warn('people backfill failed:', e.message));
+  })
   .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
