@@ -269,19 +269,23 @@ const toList = (v, max) => (Array.isArray(v) ? v : String(v || '').split(','))
 const searchTerms = (q) => String(q || '').toLowerCase().split(/\s+/).map((t) => t.trim()).filter(Boolean).slice(0, 8);
 const likeEscape = (s) => s.replace(/[\\%_]/g, (c) => '\\' + c);
 
-async function listReels({ limit = 10, cursor = null, creator = null, creators = null, topics = null, q = null, any = null } = {}) {
+async function listReels({ limit = 10, cursor = null, creator = null, creators = null, topics = null, q = null, any = null, owners = null } = {}) {
   const lim = Math.min(50, Math.max(1, Number(limit) || 10));
   const creatorList = creators ? toList(creators, 500) : [];
   const topicList = topics ? toList(topics, 200) : [];
   const terms = searchTerms(q);
   const phrases = any ? toList(any, 150).map((t) => t.toLowerCase()) : [];
   if (creators && !creatorList.length) return { items: [], nextCursor: null };
+  /* owners: account emails (Following feed). Server-side only - never from the app. */
+  const ownerList = Array.isArray(owners) ? owners.map((o) => String(o).toLowerCase()) : null;
+  if (ownerList && !ownerList.length) return { items: [], nextCursor: null };
 
   if (!HAS_DB) {
     const topicSet = new Set(topicList.map((t) => t.toLowerCase()));
     let items = memoryReels.filter((r) => {
       if (creator && r.creator !== creator) return false;
       if (creatorList.length && !creatorList.includes(r.creator)) return false;
+      if (ownerList && !ownerList.includes(String(r.owner_id || ''))) return false;
       if (topicSet.size && !topicSet.has(String(r.category || '').toLowerCase()) && !topicSet.has(String(r.subject || '').toLowerCase())) return false;
       if (terms.length) {
         const hay = [r.title, r.description, r.category, r.subject, r.creator].join(' ').toLowerCase();
@@ -302,6 +306,7 @@ async function listReels({ limit = 10, cursor = null, creator = null, creators =
   let where = `WHERE status = 'published'`;
   if (creator) { params.push(creator); where += ` AND creator = $${params.length}`; }
   if (creatorList.length) { params.push(creatorList); where += ` AND creator = ANY($${params.length}::text[])`; }
+  if (ownerList) { params.push(ownerList); where += ` AND owner_id = ANY($${params.length}::text[])`; }
   if (topicList.length) {
     params.push(topicList.map((t) => t.toLowerCase()));
     where += ` AND (lower(category) = ANY($${params.length}::text[]) OR lower(subject) = ANY($${params.length}::text[]))`;
@@ -802,6 +807,8 @@ function toClientReel(row) {
     likes: Number(row.likes || 0),
     comments: Number(row.comment_count || 0),
     shares: Number(row.share_count || 0),
+    // Public id of the uploader's account (for Follow). Null for very old reels.
+    creatorId: row.owner_id ? require('./session-service').publicId(row.owner_id) : null,
     views: row.views,
     createdAt: row.created_at,
   };
