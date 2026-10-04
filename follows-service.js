@@ -306,19 +306,19 @@ async function activeTimes(viewerPid, pids) {
 /* People to suggest after typing "@": handle or name starts with q; people
    with "Allow mentions" off are never suggested. People the viewer follows
    (or who follow the viewer) come first. */
-async function searchPeople(q, viewerPid, limit = 8) {
+async function searchPeople(q, viewerPid, limit = 8, { forMentions = true } = {}) {
   const term = String(q || '').replace(/^@/, '').trim().toLowerCase().slice(0, 30);
   let rows;
   if (!HAS_DB) {
-    rows = [...memPeople.values()].filter((p) => p.allow_mentions !== false && p.handle && p.pid !== viewerPid &&
-      (!term || p.handle.slice(1).toLowerCase().startsWith(term) || (p.name || '').toLowerCase().split(/\s+/).some((w) => w.startsWith(term))));
+    rows = [...memPeople.values()].filter((p) => (!forMentions || p.allow_mentions !== false) && (forMentions ? p.handle : true) && p.pid !== viewerPid &&
+      (!term || (p.handle || '').slice(1).toLowerCase().startsWith(term) || (p.name || '').toLowerCase().split(/\s+/).some((w) => w.startsWith(term))));
   } else {
     const like = term.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
     ({ rows } = await getPool().query(
       `SELECT pid, name, handle FROM people
-        WHERE allow_mentions AND handle IS NOT NULL AND pid <> $2
+        WHERE ($3::boolean IS FALSE OR (allow_mentions AND handle IS NOT NULL)) AND pid <> $2
           AND (lower(substr(handle,2)) LIKE $1 OR lower(name) LIKE $1 OR lower(name) LIKE '% ' || $1)
-        LIMIT 60`, [like, viewerPid || '']
+        LIMIT 60`, [like, viewerPid || '', !!forMentions]
     ));
   }
   const close = new Set([...(await followingAmong(viewerPid, rows.map((r) => r.pid))), ...(await followersAmong(viewerPid, rows.map((r) => r.pid)))]);
@@ -343,8 +343,10 @@ async function resolveMentions(text) {
 async function notify(userPid, type, fromPid, text, reelId = null) {
   if (!userPid || userPid === fromPid) return;
   const t = String(text || '').slice(0, 200);
-  if (!HAS_DB) { memNotes.push({ id: ++memNoteId, user_pid: userPid, type, from_pid: fromPid, reel_id: reelId, text: t, created_at: new Date() }); return; }
-  await getPool().query('INSERT INTO notifications (user_pid, type, from_pid, reel_id, text) VALUES ($1,$2,$3,$4,$5)', [userPid, type, fromPid, reelId, t]);
+  if (!HAS_DB) memNotes.push({ id: ++memNoteId, user_pid: userPid, type, from_pid: fromPid, reel_id: reelId, text: t, created_at: new Date() });
+  else await getPool().query('INSERT INTO notifications (user_pid, type, from_pid, reel_id, text) VALUES ($1,$2,$3,$4,$5)', [userPid, type, fromPid, reelId, t]);
+  // Also as a push notification to their phones (when Firebase is set up).
+  require('./push-service').send(userPid, type, t, reelId).catch(() => {});
 }
 async function notifyNewFollower(fromPid, toPid) {
   const from = await getPerson(fromPid);
@@ -401,8 +403,11 @@ async function noteLogin(email, deviceId, { alert = true } = {}) {
   return isNew;
 }
 
+/* Does a follow b? */
+async function isFollowing(aPid, bPid) { return (await followingAmong(aPid, [bPid])).has(bPid); }
+
 module.exports = {
-  canComment, noteLogin, setPresence, activeTimes, searchPeople, resolveMentions, notify, listNotifications,
+  isFollowing, canComment, noteLogin, setPresence, activeTimes, searchPeople, resolveMentions, notify, listNotifications,
   backfill, initSchema, upsertPerson, getPerson, counts, setFollow, list, followingIds, followeeEmails,
   pidByHandle, deleteUser, publicId: session.publicId, HAS_DB,
 };
