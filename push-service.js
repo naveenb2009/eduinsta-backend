@@ -131,7 +131,7 @@ async function send(pid, type, text, reelId = null) {
     if (cat && prefs[cat] === false) return 0;
     const tokens = await tokensFor(pid);
     if (!tokens.length) return 0;
-    const title = TITLES[type] || 'EduInsta';
+    const title = TITLES[type] || 'Gyanora';
     sentLog.push({ pid, type, title, body: text, tokens: tokens.length, at: Date.now() }); if (sentLog.length > 200) sentLog.shift();
     const sa = serviceAccount();
     if (!sa) return 0;
