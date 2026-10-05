@@ -1,5 +1,5 @@
 /**
- * Shared reel storage — the piece that turns EduInsta from a single-device
+ * Shared reel storage — the piece that turns Gyanora from a single-device
  * demo into a real platform.
  *
  * Before: uploads went into the uploader's own IndexedDB, so nobody else
