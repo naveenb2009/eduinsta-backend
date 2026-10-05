@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Delete your EduInsta account</title>
+<title>Delete your Gyanora account</title>
 <style>
 :root{
   --bg:#faf9f7; --surface:#ffffff; --text:#1c1a17; --text-dim:#5c574e;
@@ -85,13 +85,13 @@ footer a{color:var(--accent)}
 </head>
 <body>
 <div class="page">
-  <h1>Delete your EduInsta account</h1>
-  <p class="lede">This permanently removes your account, uploaded videos, subscription record, and personal data from EduInsta. You don't need the app installed to do this — verify your email below and confirm.</p>
+  <h1>Delete your Gyanora account</h1>
+  <p class="lede">This permanently removes your account, uploaded videos, subscription record, and personal data from Gyanora. You don't need the app installed to do this — verify your email below and confirm.</p>
 
   <div class="card">
     <div id="step1" class="step active">
       <h2>1. Verify your email</h2>
-      <p class="hint">Enter the email address your EduInsta account uses. We'll send a one-time code to confirm it's you.</p>
+      <p class="hint">Enter the email address your Gyanora account uses. We'll send a one-time code to confirm it's you.</p>
       <div id="msg1" class="msg error"></div>
       <label for="email">Email address</label>
       <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
@@ -111,7 +111,7 @@ footer a{color:var(--accent)}
 
     <div id="step3" class="step">
       <h2>Account deleted</h2>
-      <div id="msg3" class="msg ok show">Your EduInsta account and associated data have been deleted.</div>
+      <div id="msg3" class="msg ok show">Your Gyanora account and associated data have been deleted.</div>
       <p class="hint">If you change your mind, you're welcome to create a new account any time.</p>
     </div>
   </div>
@@ -187,7 +187,7 @@ footer a{color:var(--accent)}
       showMsg(msg2, 'Enter the verification code.');
       return;
     }
-    var confirmed = window.confirm('This permanently deletes your EduInsta account and all your data. This cannot be undone. Continue?');
+    var confirmed = window.confirm('This permanently deletes your Gyanora account and all your data. This cannot be undone. Continue?');
     if(!confirmed) return;
 
     deleteBtn.disabled = true;
