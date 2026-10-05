@@ -59,7 +59,7 @@ function generateCode() {
 function otpEmailHtml(code) {
   return `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px">
-      <h2 style="color:#0f766e;margin:0 0 4px">EduInsta</h2>
+      <h2 style="color:#0f766e;margin:0 0 4px">Gyanora</h2>
       <p style="color:#555">Your verification code is:</p>
       <div style="font-size:34px;font-weight:800;letter-spacing:.2em;color:#0f766e;
                   background:#f2fbf9;border-radius:12px;padding:16px;text-align:center">${code}</div>
@@ -69,7 +69,7 @@ function otpEmailHtml(code) {
 }
 
 const FROM_EMAIL = process.env.MAIL_FROM_EMAIL || process.env.SMTP_USER || 'onboarding@resend.dev';
-const FROM_NAME = process.env.MAIL_FROM_NAME || 'EduInsta';
+const FROM_NAME = process.env.MAIL_FROM_NAME || 'Gyanora';
 
 async function sendViaBrevo(to, code) {
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
@@ -82,7 +82,7 @@ async function sendViaBrevo(to, code) {
     body: JSON.stringify({
       sender: { name: FROM_NAME, email: FROM_EMAIL },
       to: [{ email: to }],
-      subject: `${code} is your EduInsta verification code`,
+      subject: `${code} is your Gyanora verification code`,
       htmlContent: otpEmailHtml(code),
     }),
   });
@@ -111,7 +111,7 @@ async function sendViaResend(to, code) {
     body: JSON.stringify({
       from: `${FROM_NAME} <${FROM_EMAIL}>`,
       to: [to],
-      subject: `${code} is your EduInsta verification code`,
+      subject: `${code} is your Gyanora verification code`,
       html: otpEmailHtml(code),
     }),
   });
@@ -139,8 +139,8 @@ async function sendViaSmtp(to, code) {
   await transport.sendMail({
     from: `${FROM_NAME} <${FROM_EMAIL}>`,
     to,
-    subject: `${code} is your EduInsta verification code`,
-    text: `Your EduInsta verification code is ${code}. It expires in 5 minutes.`,
+    subject: `${code} is your Gyanora verification code`,
+    text: `Your Gyanora verification code is ${code}. It expires in 5 minutes.`,
     html: otpEmailHtml(code),
   });
 }
