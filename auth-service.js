@@ -10,7 +10,7 @@
  * would fail with "No account found on this device yet" even though the
  * user never asked to delete anything.
  *
- * This module gives EduInsta actual server-side accounts: email + a
+ * This module gives Gyanora actual server-side accounts: email + a
  * securely hashed password, persisted in Postgres (or an in-memory map in
  * MEMORY MODE, same fallback pattern as reels-service.js and
  * diagnostics-service.js). A reinstall no longer loses your login.
