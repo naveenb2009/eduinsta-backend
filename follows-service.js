@@ -83,7 +83,7 @@ const cleanHandle = (h) => {
   if (!x.startsWith('@')) x = '@' + x;
   return x;
 };
-const toClient = (p) => p && ({ pid: p.pid, name: p.name || 'EduInsta user', handle: p.handle || null });
+const toClient = (p) => p && ({ pid: p.pid, name: p.name || 'Gyanora user', handle: p.handle || null });
 
 /* Create or refresh someone's public card. Only given fields change. */
 async function upsertPerson({ email, name, handle }) {
@@ -323,7 +323,7 @@ async function searchPeople(q, viewerPid, limit = 8, { forMentions = true } = {}
   }
   const close = new Set([...(await followingAmong(viewerPid, rows.map((r) => r.pid))), ...(await followersAmong(viewerPid, rows.map((r) => r.pid)))]);
   return rows.sort((a, b) => (close.has(b.pid) ? 1 : 0) - (close.has(a.pid) ? 1 : 0))
-    .slice(0, limit).map((p) => ({ pid: p.pid, name: p.name || 'EduInsta user', handle: p.handle }));
+    .slice(0, limit).map((p) => ({ pid: p.pid, name: p.name || 'Gyanora user', handle: p.handle }));
 }
 /* "@handle" words in a comment -> the people they refer to (one person per
    handle; handles used by several people are skipped). */
