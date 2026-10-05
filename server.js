@@ -1,5 +1,5 @@
 /**
- * EduInsta backend — payments, subscription verification, owner earnings.
+ * Gyanora backend — payments, subscription verification, owner earnings.
  *
  * WHY THIS EXISTS
  * ---------------
@@ -311,7 +311,7 @@ app.get('/diagnostics', async (req, res) => {
     </tr>`).join('');
 
   res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>EduInsta diagnostics</title>
+    <title>Gyanora diagnostics</title>
     <style>
       body{font-family:system-ui,sans-serif;background:#0d0f10;color:#e8e6e1;padding:24px;margin:0}
       h1{font-size:1.2rem;margin:0 0 4px} .sub{color:#9b9689;font-size:.85rem;margin:0 0 20px}
@@ -323,7 +323,7 @@ app.get('/diagnostics', async (req, res) => {
       pre{white-space:pre-wrap;word-break:break-word;font-size:.75rem;color:#c9c5b8;max-width:480px}
       code{color:#9b9689}
     </style></head><body>
-    <h1>EduInsta diagnostics</h1>
+    <h1>Gyanora diagnostics</h1>
     <p class="sub">${events.length} most recent event${events.length===1?'':'s'}. Filter with ?type=crash|error|performance, ?limit=N.</p>
     <table><thead><tr><th>Time</th><th>Type</th><th>User</th><th>Message</th><th>Version</th><th>Details</th></tr></thead>
     <tbody>${rowsHtml || '<tr><td colspan="6">No events yet.</td></tr>'}</tbody></table>
@@ -507,7 +507,7 @@ app.get('/api/reels/:id/likes', async (req, res) => {
     for (const id of users) {
       let name = null;
       try { const u = await authService.getUser(id); name = u && u.name; } catch {}
-      likers.push({ name: name || 'EduInsta user', you: String(id).toLowerCase() === me });
+      likers.push({ name: name || 'Gyanora user', you: String(id).toLowerCase() === me });
     }
     res.json({ ok: true, total, likers, nextCursor });
   } catch (err) {
@@ -912,7 +912,7 @@ app.get('/api/people/:pid', async (req, res) => {
       followsService.isFollowing(pid, myPid),
     ]);
     res.json({
-      ok: true, pid, name: p.name || 'EduInsta user', handle: p.handle || null,
+      ok: true, pid, name: p.name || 'Gyanora user', handle: p.handle || null,
       followers: c.followers, following: c.following, reels: reels.total || 0,
       youFollow, followsYou, you: pid === myPid, activeAt: act.get(pid) || null,
     });
@@ -1433,7 +1433,7 @@ app.get('/api/debug/gemini-models', async (_req, res) => {
      1. A messaging app's link-preview crawler (WhatsApp, Telegram, iMessage)
         fetches this URL and reads the Open Graph tags below to build a rich
         preview card (thumbnail + title), not a plain blue link.
-     2. On Android, if EduInsta is installed, Android's App Links system
+     2. On Android, if Gyanora is installed, Android's App Links system
         intercepts this https:// URL BEFORE it reaches a browser (see the
         intent-filter injected into AndroidManifest.xml + the
         /.well-known/assetlinks.json route below) and opens the app
@@ -1451,8 +1451,8 @@ app.get('/reel/:id', async (req, res) => {
     const row = await reelsService.getReel(req.params.id);
     if (!row) return res.status(404).send('This reel is no longer available.');
     const r = reelsService.toClientReel(row);
-    const title = escapeHtmlText(`${r.title} — EduInsta`);
-    const desc = escapeHtmlText(r.desc || `${r.creator} on EduInsta`);
+    const title = escapeHtmlText(`${r.title} — Gyanora`);
+    const desc = escapeHtmlText(r.desc || `${r.creator} on Gyanora`);
     const origin = `${req.protocol}://${req.get('host')}`;
     // og:video / <video src> must be an ABSOLUTE url — WhatsApp/Telegram's
     // preview crawlers (and most players) won't resolve a relative one the
@@ -1478,11 +1478,11 @@ p.muted{color:#9aa4b8}</style>
 </head><body>
 <h2>${title}</h2>
 <p class="muted">${desc}</p>
-<a class="btn" href="${appLink}">Open in EduInsta</a>
+<a class="btn" href="${appLink}">Open in Gyanora</a>
 <p class="muted" style="margin-top:14px">Don't have the app? <a href="https://play.google.com/store/apps/details?id=com.eduinsta.app" style="color:#5eead4">Get it on Google Play</a></p>
 ${videoUrl ? `<video src="${videoUrl}" controls playsinline></video>` : ''}
 <script>
-  // If EduInsta is installed but Android's App Link verification hasn't
+  // If Gyanora is installed but Android's App Link verification hasn't
   // kicked in yet on this device, the button above still opens the app via
   // its custom URL scheme. Never auto-redirect - some browsers show a scary
   // warning dialog for that, so this stays a deliberate tap.
@@ -1538,7 +1538,7 @@ app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema(), followsService.initSchema(), reportsService.initSchema(), pushService.initSchema()])
   .then(() => {
-    app.listen(PORT, () => console.log(`EduInsta backend listening on :${PORT}`));
+    app.listen(PORT, () => console.log(`Gyanora backend listening on :${PORT}`));
     followsService.backfill().then((n) => n && console.log(`people: added ${n} existing accounts`)).catch((e) => console.warn('people backfill failed:', e.message));
   })
   .catch((err) => { console.error('Schema init failed:', err); process.exit(1); });
