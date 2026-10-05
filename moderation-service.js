@@ -29,7 +29,7 @@ const ALLOWED_CATEGORIES = [
    counts as educational, and asks for structured JSON so the result can be
    acted on programmatically rather than parsed out of prose. */
 function buildPrompt() {
-  return `You are the content reviewer for EduInsta, an educational short-video platform.
+  return `You are the content reviewer for Gyanora, an educational short-video platform.
 
 Decide whether this video belongs on an EDUCATION app. Be fair, not harsh:
 approve anything where a meaningful part of the video teaches, explains,
@@ -56,7 +56,7 @@ REJECT when the whole video is one of these, with no real teaching in it:
 - movie/TV/web-series clips, celebrity gossip, fashion or beauty with no how-to
 - gaming or vlogs with no teaching, random pets/scenery/daily-life footage
 - pure advertisements or product/brand promotion (advertisers use the separate
-  "Advertise on EduInsta" flow, so set content_type to "advertisement")
+  "Advertise on Gyanora" flow, so set content_type to "advertisement")
 - sexual, suggestive or adult content of any kind (set safety_flags)
 
 SEPARATELY, set safety_flags (and only then) if the video contains:
