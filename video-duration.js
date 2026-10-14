@@ -48,4 +48,4 @@ function videoDurationSeconds(buf, mime = '') {
   return Number.isFinite(d) && d > 0 && d < 24 * 3600 ? d : null;
 }
 
-module.exports = { videoDurationSeconds, MAX_VIDEO_SECONDS: 180 };
+module.exports = { videoDurationSeconds, MAX_VIDEO_SECONDS: 300 };
