@@ -40,13 +40,15 @@ const followsService = require('./follows-service');
 const reportsService = require('./reports-service');
 const pushService = require('./push-service');
 const { videoDurationSeconds, MAX_VIDEO_SECONDS } = require('./video-duration');
-/* Reels can be at most 3 minutes. Null when the length can't be read from
-   the file (then it's allowed; the app also checks on the phone). */
+/* Reels can be at most MAX_VIDEO_SECONDS. Null when the length can't be read
+   from the file (then it's allowed; the app also checks on the phone). */
 function tooLong(file) {
   const d = videoDurationSeconds(file.buffer, file.mimetype);
   return d != null && d > MAX_VIDEO_SECONDS + 0.5 ? d : null;
 }
-const tooLongMessage = (d) => `This video is ${Math.floor(d / 60)}:${String(Math.round(d % 60)).padStart(2, '0')} long. Reels can be at most 3 minutes - please trim it and try again.`;
+const mmss = (d) => `${Math.floor(d / 60)}:${String(Math.round(d % 60)).padStart(2, '0')}`;
+/* Built from MAX_VIDEO_SECONDS so the limit is stated in one place only. */
+const tooLongMessage = (d) => `This video is ${mmss(d)} long. Reels can be at most ${Math.round(MAX_VIDEO_SECONDS / 60)} minutes - please trim it and try again.`;
 const session = require('./session-service');
 const campaignsService = require('./campaigns-service');
 const reelsService = require('./reels-service');
@@ -1494,6 +1496,66 @@ ${videoUrl ? `<video src="${videoUrl}" controls playsinline></video>` : ''}
   }
 });
 
+
+/* ------------------------------------------------------------------
+   PROFILE SHARE PAGE — the counterpart of /reel/:id for people.
+   "Share profile" in the app had no page to point at, so it could only
+   send a bare name with no link. This gives every @handle a real address
+   that previews nicely in WhatsApp/Telegram and opens the app when it is
+   installed (App Links; see the intent-filter and assetlinks.json).
+   ------------------------------------------------------------------ */
+app.get('/u/:handle', async (req, res) => {
+  try {
+    const handle = String(req.params.handle || '').replace(/^@+/, '');
+    const pid = await followsService.pidByHandle('@' + handle);
+    const p = pid ? await followsService.getPerson(pid) : null;
+    if (!p) return res.status(404).send('This Gyanora profile is not available.');
+    const counts = await followsService.counts(pid).catch(() => ({ followers: 0, following: 0 }));
+    const name = escapeHtmlText(p.name || 'Gyanora user');
+    const at = escapeHtmlText(p.handle || '@' + handle);
+    const title = `${name} (${at}) — Gyanora`;
+    const desc = escapeHtmlText(`${counts.followers || 0} followers · Educational reels on Gyanora`);
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const pageUrl = escapeHtmlText(`${origin}/u/${encodeURIComponent(handle)}`);
+    const appLink = `eduinsta://u/${encodeURIComponent(handle)}`;
+    res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${desc}">
+<meta property="og:type" content="profile">
+<meta property="og:url" content="${pageUrl}">
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#05070c;color:#fff;text-align:center;padding:48px 20px;margin:0}
+.avatar{width:84px;height:84px;border-radius:50%;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:800;color:#04101a;background:linear-gradient(135deg,#5eead4,#7c6cf6)}
+a.btn{display:inline-block;margin-top:22px;padding:12px 24px;border-radius:24px;background:linear-gradient(135deg,#5eead4,#38bdf8);color:#05070c;text-decoration:none;font-weight:600}
+p.muted{color:#9aa4b8}</style>
+</head><body>
+<div class="avatar">${escapeHtmlText(String(p.name || 'G').charAt(0).toUpperCase())}</div>
+<h2>${name}</h2>
+<p class="muted">${at} · ${desc}</p>
+<a class="btn" href="${appLink}">Open in Gyanora</a>
+<p class="muted" style="margin-top:14px">Don't have the app? <a href="https://play.google.com/store/apps/details?id=com.eduinsta.app" style="color:#5eead4">Get it on Google Play</a></p>
+</body></html>`);
+  } catch (err) {
+    console.error('profile page failed:', err);
+    res.status(500).send('Something went wrong loading this profile.');
+  }
+});
+
+/* The app turns a shared /u/<handle> link into the profile to open. */
+app.get('/api/people/by-handle/:handle', async (req, res) => {
+  if (!signedInUser(req)) return res.status(401).json({ ok: false, error: 'Please log in again.' });
+  try {
+    const pid = await followsService.pidByHandle('@' + String(req.params.handle || '').replace(/^@+/, ''));
+    if (!pid) return res.status(404).json({ ok: false, error: 'This account no longer exists.' });
+    res.json({ ok: true, pid });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not look up that profile.' });
+  }
+});
+
 /* Android App Links verification file. Confirms to Android that WE, the
    owner of this domain, authorize com.eduinsta.app to auto-open
    https://<this host>/reel/* links directly instead of a browser.
@@ -1535,6 +1597,18 @@ const DELETE_ACCOUNT_HTML = fs.readFileSync(path.join(__dirname, 'delete-account
 app.get('/delete-account', (_req, res) => res.type('html').send(DELETE_ACCOUNT_HTML));
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+/* An upload bigger than multer's limit throws before any route runs, which
+   would otherwise reach the client as an HTML 500 the app can't read. Say
+   plainly that the file is too large, in the shape each route returns. */
+const MAX_UPLOAD_MB = Math.round((100 * 1024 * 1024) / (1024 * 1024));
+app.use((err, req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    const reason = `This video is larger than ${MAX_UPLOAD_MB} MB. Please upload a smaller file (lower the quality, or trim it).`;
+    return res.status(413).json(req.path === '/api/reels' ? { error: reason } : { status: 'error', reason });
+  }
+  return next(err);
+});
 
 Promise.all([reelsService.initSchema(), diagnosticsService.initSchema(), authService.initSchema(), subscriptionsService.initSchema(), campaignsService.initSchema(), followsService.initSchema(), reportsService.initSchema(), pushService.initSchema()])
   .then(() => {
